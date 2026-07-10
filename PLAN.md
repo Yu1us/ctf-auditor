@@ -14,15 +14,15 @@
 
 1. 初始化时记录授权范围和最小成功指标。
 2. 同时最多 3 个活跃假设；每个假设必须可证伪。
-3. strict 模式移除内置 `bash`，命令只能通过 `ctf_experiment` 执行。
+3. 默认采用 balanced 策略：先做低成本验证，再扩大实验范围；命令只能通过 `ctf_experiment` 执行。
 4. 上一实验未归纳前禁止下一实验。
 5. 完整 stdout/stderr、命令、cwd、退出码和时间落盘；模型只接收截断结果。
 6. 合成测试不能产生 `OBSERVED` 结论；生成代码本身不算证据。
 7. 同一假设连续两次 `REFUTES` 或无新增信息的 `INCONCLUSIVE` 后要求 replan。
-8. 高风险命令必须人工批准；无 UI 时拒绝。所有执行限制在授权工作区。
+8. “高风险”主要指证据不足时进行高耗时、高资源或过深探索；这类实验必须人工批准。不可逆操作同样需要批准，路径越界始终拒绝。
 9. 人工确认前不能把 run 标记为完成。
 
-其余评分、Dashboard、远程后端、通用 Gate、reviewer LLM 和多模式策略暂不实现。
+其余评分、Dashboard、远程后端、通用 Gate、reviewer LLM 和多模式策略暂不实现。MVP 只实现 balanced，不增加模式切换。
 
 ## 最小代码结构
 
@@ -117,14 +117,25 @@ interface State {
   expectedSupports: string;
   expectedRefutes: string;
   sampleKind: "REAL" | "SYNTHETIC" | "POST_HOC";
-  risk: "LOW" | "HIGH";
+  evidenceExperimentIds: string[];
+  evidenceBasis: string;
+  estimatedCost: "LOW" | "HIGH";
+  explorationDepth: "PROBE" | "DEEP";
+  irreversible: boolean;
   timeoutSeconds: number;
 }
 ```
 
-执行顺序：校验状态 → 必要时审批 → 在授权 cwd 执行 → 完整输出落盘 → 返回截断摘要 → 状态改为 `AWAITING_CONCLUSION`。
+执行顺序：校验状态和证据引用 → 判定是否审批 → 在授权 cwd 执行 → 完整输出落盘 → 返回截断摘要 → 状态改为 `AWAITING_CONCLUSION`。
 
-使用 Pi/Node 现有进程执行和截断能力，不自行实现 shell parser、进程树管理或日志框架。
+balanced 风险规则：
+
+- `LOW + PROBE + 可逆`：直接执行；读取、搜索、短时局部验证默认属于此类。
+- `HIGH` 或 `DEEP`：若没有引用相关、已关闭的真实实验，视为证据不足，必须人工批准；无 UI 时拒绝。
+- 不可逆操作始终需要批准；授权工作区外的操作始终拒绝，不能靠批准放行。
+- 风险不按“命令看起来危险”判断，而按错误方向上的预期时间、CPU、网络、磁盘、影响范围和回退成本判断。
+
+引用只验证实验存在且已关闭，不让扩展猜测语义相关性；模型给出的依据和成本声明一并落盘，供人工审批和事后审计。使用 Pi/Node 现有进程执行和截断能力，不自行实现 shell parser、进程树管理或日志框架。
 
 ### `ctf_conclude`
 
@@ -161,7 +172,7 @@ interface State {
 
 ## 必要 Hooks
 
-- `session_start`：加载 state，strict run 时移除内置 `bash` 并显示 Widget。
+- `session_start`：加载 state，移除内置 `bash` 并显示 Widget，确保所有命令经过 balanced 风险门。
 - `before_agent_start`：注入当前成功指标、活跃假设和阻塞原因。
 - `tool_call`：阻止授权工作区外的 `write/edit`，并拒绝未知执行型工具。
 - `session_shutdown`：flush 状态并恢复原 active tools。
@@ -176,7 +187,7 @@ interface State {
 
 - `setActiveTools()` 可移除/恢复 Bash；
 - 自定义工具支持取消、timeout 和截断；
-- 无 UI 审批可 fail-closed；
+- 高成本/深探索且证据不足时触发审批，无 UI 可 fail-closed；
 - Windows/Linux 下 cwd、路径 canonicalization 和进程终止有效。
 
 验证结果直接写入本文件勾选，不单建 API 报告系统。
@@ -185,14 +196,14 @@ interface State {
 
 1. 状态模型、原子保存和 JSONL 事件追加；
 2. `ctf_run`；
-3. strict Bash 切换；
+3. Bash 移除/恢复与 balanced 风险判定；
 4. `ctf_experiment` 与原始输出落盘；
 5. `ctf_conclude` 与两次失败 replan；
 6. `/ctf status|complete|abort` 和单行 Widget。
 
 ### 2. 仅补真实缺口
 
-完成一次本地 CTF golden run 后，只修复实际暴露的问题。不要预先加入 balanced/observe、HTML 报告、Docker/SSH、评分器或可插拔 backend。
+完成一次本地 CTF golden run 后，只修复实际暴露的问题。不要预先加入 strict/observe 等额外模式、HTML 报告、Docker/SSH、评分器或可插拔 backend。
 
 ## 最小测试
 
@@ -203,20 +214,23 @@ interface State {
 3. 未归纳时第二个实验被拒绝；
 4. synthetic `OBSERVED` 被拒绝；
 5. 连续两次失败进入 `REPLAN_REQUIRED`；
-6. 工作区路径逃逸和无 UI 高风险命令被拒绝；
-7. resume 后 state 可恢复。
+6. 低成本局部 probe 无需审批；
+7. 无证据的高成本/深探索、不可逆操作在无 UI 时被拒绝；
+8. 即使获批，工作区路径逃逸仍被拒绝；
+9. resume 后 state 可恢复。
 
-另做一次人工集成检查：strict 下模型无法直接调用 Bash，实验原始输出可从磁盘回放。
+另做一次人工集成检查：模型无法绕过 `ctf_experiment` 直接调用 Bash，实验原始输出可从磁盘回放。
 
 ## MVP 验收
 
 - [ ] 授权范围和成功指标必填；
-- [ ] strict 下无内置 Bash；
+- [ ] 无内置 Bash，所有命令经过 balanced 风险门；
 - [ ] 每个命令绑定假设及 supports/refutes 判据；
 - [ ] 每次只允许一个待归纳实验；
 - [ ] 原始输出和执行元数据可追溯；
 - [ ] synthetic/post-hoc 不会提升为虚假观察；
 - [ ] 两次失败强制 replan；
-- [ ] 路径越界及无 UI 高风险操作 fail-closed；
+- [ ] 低成本 probe 不打断用户，无证据的高成本/深探索需要审批；
+- [ ] 不可逆操作需审批，路径越界始终 fail-closed；
 - [ ] 人工确认后才能完成 run；
 - [ ] resume 后状态不丢失。
