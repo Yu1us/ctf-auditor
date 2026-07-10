@@ -12,7 +12,7 @@
 
 ## 必须保证
 
-1. 初始化时记录授权范围和最小成功指标。
+1. 初始化时记录最小成功指标和工作区。
 2. 同时最多 3 个活跃假设；每个假设必须可证伪。
 3. 默认采用 balanced 策略：先做低成本验证，再扩大实验范围；命令只能通过 `ctf_experiment` 执行。
 4. 上一实验未归纳前禁止下一实验。
@@ -54,10 +54,23 @@
 type Grade = "OBSERVED" | "DERIVED";
 type Verdict = "SUPPORTS" | "REFUTES" | "INCONCLUSIVE";
 
+interface ExperimentRequest {
+  hypothesisId: string;
+  command: string;
+  expectedSupports: string;
+  expectedRefutes: string;
+  sampleKind: "REAL" | "SYNTHETIC";
+  evidenceExperimentIds: string[];
+  evidenceBasis: string;
+  estimatedCost: "LOW" | "HIGH";
+  explorationDepth: "PROBE" | "DEEP";
+  irreversible: boolean;
+  timeoutSeconds: number;
+}
+
 interface State {
   run: {
     id: string;
-    authorizationScope: string;
     successCriterion: string;
     workspace: string;
     status: "ACTIVE" | "REPLAN_REQUIRED" | "COMPLETE" | "ABORTED";
@@ -71,8 +84,7 @@ interface State {
   }>;
   experiments: Array<{
     id: string;
-    hypothesisId: string;
-    sampleKind: "REAL" | "SYNTHETIC";
+    request: ExperimentRequest;
     status: "RUNNING" | "AWAITING_CONCLUSION" | "CLOSED";
     result?: { exitCode: number };
     conclusion?: {
@@ -94,7 +106,7 @@ interface State {
 
 动作：`init | add_hypothesis | park_hypothesis | replan | status`
 
-- `init`：要求授权范围、成功指标和工作区。
+- `init`：要求成功指标和工作区。
 - `add_hypothesis`：要求 statement 和 falsificationTest。
 - `replan`：记录理由，清除 `REPLAN_REQUIRED`。
 - `status`：返回当前假设、待归纳实验和成功指标。
@@ -215,7 +227,7 @@ balanced 风险规则：
 
 ## MVP 验收
 
-- [ ] 授权范围和成功指标必填；
+- [ ] 成功指标和工作区必填；
 - [ ] 无内置 Bash，所有命令经过 balanced 风险门；
 - [ ] 每个命令绑定假设及 supports/refutes 判据；
 - [ ] 每次只允许一个待归纳实验；
