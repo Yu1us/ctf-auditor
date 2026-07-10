@@ -39,7 +39,6 @@
 ```text
 .pi/ctf-runs/<run-id>/
 ├── state.json
-├── events.jsonl
 └── experiments/E0001/
     ├── request.json
     ├── stdout.txt
@@ -47,12 +46,12 @@
     └── result.json
 ```
 
-`state.json` 用临时文件 + rename 原子更新；`events.jsonl` 只追加。无需为 hypothesis、claim、artifact 分别建立 ledger。
+`state.json` 用临时文件 + rename 原子更新。实验请求和结果以实验目录为准，无需额外事件日志，也不为 hypothesis、claim、artifact 分别建立 ledger。
 
 ## 最小数据模型
 
 ```ts
-type Grade = "OBSERVED" | "DERIVED" | "HYPOTHESIS" | "REJECTED";
+type Grade = "OBSERVED" | "DERIVED";
 type Verdict = "SUPPORTS" | "REFUTES" | "INCONCLUSIVE";
 
 interface State {
@@ -67,20 +66,15 @@ interface State {
     id: string;
     statement: string;
     falsificationTest: string;
-    successSignal: string;
-    failureSignal: string;
     status: "ACTIVE" | "SUPPORTED" | "REFUTED" | "PARKED";
     consecutiveFailures: number;
   }>;
   experiments: Array<{
     id: string;
     hypothesisId: string;
-    command: string;
-    expectedSupports: string;
-    expectedRefutes: string;
-    sampleKind: "REAL" | "SYNTHETIC" | "POST_HOC";
+    sampleKind: "REAL" | "SYNTHETIC";
     status: "RUNNING" | "AWAITING_CONCLUSION" | "CLOSED";
-    result?: { exitCode: number; stdoutPath: string; stderrPath: string };
+    result?: { exitCode: number };
     conclusion?: {
       verdict: Verdict;
       observations: string[];
@@ -88,7 +82,6 @@ interface State {
       nextAction: string;
     };
   }>;
-  activeExperimentId?: string;
   seq: number;
 }
 ```
@@ -102,7 +95,7 @@ interface State {
 动作：`init | add_hypothesis | park_hypothesis | replan | status`
 
 - `init`：要求授权范围、成功指标和工作区。
-- `add_hypothesis`：要求 statement、falsificationTest、successSignal、failureSignal。
+- `add_hypothesis`：要求 statement 和 falsificationTest。
 - `replan`：记录理由，清除 `REPLAN_REQUIRED`。
 - `status`：返回当前假设、待归纳实验和成功指标。
 
@@ -116,7 +109,7 @@ interface State {
   command: string;
   expectedSupports: string;
   expectedRefutes: string;
-  sampleKind: "REAL" | "SYNTHETIC" | "POST_HOC";
+  sampleKind: "REAL" | "SYNTHETIC";
   evidenceExperimentIds: string[];
   evidenceBasis: string;
   estimatedCost: "LOW" | "HIGH";
@@ -154,8 +147,7 @@ balanced 风险规则：
 规则：
 
 - 只能归纳当前待处理实验；
-- `SYNTHETIC` 的 claim 最高为 `HYPOTHESIS`；
-- `POST_HOC` 不能产生原 run 的 `OBSERVED`；
+- `SYNTHETIC` 的 claim 只能为 `DERIVED`；
 - 关闭实验并更新假设；连续失败 2 次进入 `REPLAN_REQUIRED`。
 
 ### `/ctf`
@@ -194,7 +186,7 @@ balanced 风险规则：
 
 ### 1. 单文件 MVP
 
-1. 状态模型、原子保存和 JSONL 事件追加；
+1. 状态模型和原子保存；
 2. `ctf_run`；
 3. Bash 移除/恢复与 balanced 风险判定；
 4. `ctf_experiment` 与原始输出落盘；
@@ -228,7 +220,7 @@ balanced 风险规则：
 - [ ] 每个命令绑定假设及 supports/refutes 判据；
 - [ ] 每次只允许一个待归纳实验；
 - [ ] 原始输出和执行元数据可追溯；
-- [ ] synthetic/post-hoc 不会提升为虚假观察；
+- [ ] synthetic 不会提升为虚假观察；
 - [ ] 两次失败强制 replan；
 - [ ] 低成本 probe 不打断用户，无证据的高成本/深探索需要审批；
 - [ ] 不可逆操作需审批，路径越界始终 fail-closed；

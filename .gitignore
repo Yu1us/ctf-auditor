@@ -1,17 +1,1 @@
-# Pi runtime data
-.pi/ctf-runs/
-.pi/git/
-
-# Node dependencies and build output
-node_modules/
-dist/
-coverage/
-
-# Local configuration and secrets
-.env
-.env.*
-!.env.example
-
-# OS files
-.DS_Store
-Thumbs.db
+.pi/
