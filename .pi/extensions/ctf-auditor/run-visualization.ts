@@ -1,8 +1,8 @@
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readFile, rename, stat, writeFile } from "node:fs/promises";
+import { join, relative, resolve, sep } from "node:path";
 import type { ExperimentRequest, State } from "./index.ts";
 
-type FileState = "PRESENT" | "MISSING" | "INVALID";
+export type FileState = "PRESENT" | "MISSING" | "INVALID";
 type JsonRead<T> = { state: FileState; value?: T; warning?: string };
 
 type ExperimentResult = {
@@ -53,9 +53,82 @@ export interface RunView {
 	warnings: string[];
 }
 
-export interface MermaidGenerationResult {
+export type FlowVariant = "active" | "supported" | "refuted" | "pending" | "parked" | "closed" | "error";
+
+export interface FlowFile {
+	state: FileState;
+	href: string;
+}
+
+export interface FlowConclusion {
+	experimentId: string;
+	verdict: string;
+	grade: string;
+	conclusion: string;
+	nextAction: string;
+	variant: FlowVariant;
+}
+
+export interface FlowExperiment {
+	index: number;
+	id: string;
+	hypothesisId: string;
+	sampleKind: string;
+	status: string;
+	variant: FlowVariant;
+	request?: {
+		command?: string;
+		expectedSupports?: string;
+		expectedRefutes?: string;
+		risk?: string;
+		timeoutSeconds?: number;
+	};
+	execution?: {
+		exitCode?: string | number;
+		killed?: boolean;
+	};
+	conclusion?: FlowConclusion;
+	files: {
+		request: FlowFile;
+		result: FlowFile;
+		stdout: FlowFile;
+		stderr: FlowFile;
+	};
+}
+
+export interface FlowHypothesis {
+	index: number;
+	id: string;
+	statement: string;
+	falsificationTest: string;
+	status: string;
+	consecutiveFailures: number;
+	variant: FlowVariant;
+	experiments: FlowExperiment[];
+}
+
+export interface FlowRun {
+	id: string;
+	successCriterion: string;
+	workspace: string;
+	status: string;
+	variant: FlowVariant;
+}
+
+export interface FlowDocument {
+	run: FlowRun;
+	hypotheses: FlowHypothesis[];
+	orphanExperiments: FlowExperiment[];
+	warnings: string[];
+}
+
+export interface ViewerAssets {
+	javascript: string;
+	stylesheet: string;
+}
+
+export interface FlowGenerationResult {
 	outputPath: string;
-	mermaid: string;
 	warnings: string[];
 	nodes: number;
 }
@@ -187,44 +260,21 @@ export async function loadRunView(runsRoot: string, runId: string): Promise<RunV
 	return { run: state.run, hypotheses, orphanExperiments, warnings };
 }
 
-function summarize(value: unknown, maxLength: number): string {
-	const text = String(value ?? "")
-		.replace(/[\r\n\t]+/g, " ")
-		.replace(/\s+/g, " ")
-		.trim();
-	const characters = [...text];
-	return characters.length <= maxLength ? text : `${characters.slice(0, Math.max(0, maxLength - 1)).join("")}…`;
-}
-
-function escapeLabel(value: unknown, maxLength = 120): string {
-	return summarize(value, maxLength)
-		.replace(/&/g, "&amp;")
-		.replace(/\\/g, "&#92;")
-		.replace(/"/g, "&quot;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.replace(/\|/g, "&#124;");
-}
-
-function label(lines: Array<string | undefined>): string {
-	return lines.filter((line): line is string => Boolean(line)).join("<br/>");
-}
-
-function runClass(status: string): string {
+function runClass(status: string): FlowVariant {
 	if (status === "COMPLETE") return "supported";
 	if (status === "ABORTED") return "refuted";
 	if (status === "REPLAN_REQUIRED") return "pending";
 	return "active";
 }
 
-function hypothesisClass(status: string): string {
+function hypothesisClass(status: string): FlowVariant {
 	if (status === "SUPPORTED") return "supported";
 	if (status === "REFUTED") return "refuted";
 	if (status === "PARKED") return "parked";
 	return "active";
 }
 
-function experimentClass(experiment: ExperimentView): string {
+function experimentClass(experiment: ExperimentView): FlowVariant {
 	const outputMissing = experiment.status !== "RUNNING" &&
 		(experiment.files.stdout !== "PRESENT" || experiment.files.stderr !== "PRESENT");
 	if (
@@ -236,106 +286,150 @@ function experimentClass(experiment: ExperimentView): string {
 	return experiment.status === "CLOSED" ? "closed" : "pending";
 }
 
-function conclusionClass(verdict: unknown): string {
+function conclusionClass(verdict: unknown): FlowVariant {
 	if (verdict === "SUPPORTS") return "supported";
 	if (verdict === "REFUTES") return "refuted";
 	return "pending";
 }
 
-function fileMarker(name: string, state: FileState): string | undefined {
-	return state === "PRESENT" ? undefined : `${name}: ${state}`;
+function optionalText(value: unknown): string | undefined {
+	return value === undefined || value === null ? undefined : String(value);
 }
 
-export function renderRunMermaid(view: RunView): string {
-	const lines = ["flowchart LR"];
-	let nodes = 1;
-	lines.push(
-		`  run_0["${label([
-			`Run ${escapeLabel(view.run.id, 80)}`,
-			`Status: ${escapeLabel(view.run.status, 40)}`,
-			`Success: ${escapeLabel(view.run.successCriterion)}`,
-			`Workspace: ${escapeLabel(view.run.workspace)}`,
-		])}"]:::${runClass(view.run.status)}`,
-	);
-
-	for (const hypothesis of view.hypotheses) {
-		const hypothesisNode = `hyp_${hypothesis.index}`;
-		nodes += 1;
-		lines.push(
-			`  ${hypothesisNode}["${label([
-				`${escapeLabel(hypothesis.id, 40)} · ${escapeLabel(hypothesis.status, 40)}`,
-				escapeLabel(hypothesis.statement),
-				`Failures: ${hypothesis.consecutiveFailures}`,
-			])}"]:::${hypothesisClass(hypothesis.status)}`,
-			`  run_0 --> ${hypothesisNode}`,
-		);
-		for (const experiment of hypothesis.experiments) {
-			nodes += renderExperiment(lines, hypothesisNode, experiment);
-		}
-	}
-
-	for (const experiment of view.orphanExperiments) {
-		nodes += renderExperiment(lines, "run_0", experiment, true);
-	}
-
-	lines.push(
-		"  classDef active fill:#dbeafe,stroke:#2563eb,color:#172554",
-		"  classDef supported fill:#dcfce7,stroke:#16a34a,color:#14532d",
-		"  classDef refuted fill:#fee2e2,stroke:#dc2626,color:#7f1d1d",
-		"  classDef pending fill:#fef3c7,stroke:#d97706,color:#78350f",
-		"  classDef parked fill:#f3f4f6,stroke:#6b7280,color:#374151",
-		"  classDef closed fill:#f3f4f6,stroke:#6b7280,color:#374151",
-		"  classDef error fill:#fee2e2,stroke:#dc2626,stroke-width:2px,stroke-dasharray:5 5,color:#7f1d1d",
-	);
-	return `${lines.join("\n")}\n`;
+function flowFile(experimentId: string, name: string, state: FileState): FlowFile {
+	return {
+		state,
+		href: `experiments/${encodeURIComponent(experimentId)}/${name}`,
+	};
 }
 
-function renderExperiment(lines: string[], parentNode: string, experiment: ExperimentView, orphan = false): number {
-	const experimentNode = `exp_${experiment.index}`;
+function buildFlowExperiment(experiment: ExperimentView): FlowExperiment {
 	const request = experiment.request;
 	const execution = experiment.result?.execution;
-	const markers = [
-		fileMarker("request.json", experiment.files.request),
-		fileMarker("result.json", experiment.files.result),
-		fileMarker("stdout.txt", experiment.files.stdout),
-		fileMarker("stderr.txt", experiment.files.stderr),
-	];
-	lines.push(
-		`  ${experimentNode}["${label([
-			`${escapeLabel(experiment.id, 40)} · ${escapeLabel(experiment.status, 40)}`,
-			orphan ? `Missing hypothesis: ${escapeLabel(experiment.hypothesisId, 40)}` : undefined,
-			`Sample: ${escapeLabel(experiment.sampleKind, 40)} · Risk: ${escapeLabel(request?.risk ?? "UNKNOWN", 40)}`,
-			request?.command === undefined ? "Command: UNKNOWN" : `Command: ${escapeLabel(request.command, 160)}`,
-			execution?.exitCode === undefined ? undefined : `Exit: ${escapeLabel(execution.exitCode, 30)}`,
-			...markers,
-		])}"]:::${orphan ? "error" : experimentClass(experiment)}`,
-		`  ${parentNode} --> ${experimentNode}`,
-	);
 	const conclusion = experiment.result?.conclusion;
-	if (!conclusion) return 1;
-	const conclusionNode = `conclusion_${experiment.index}`;
-	lines.push(
-		`  ${conclusionNode}["${label([
-			`${escapeLabel(conclusion.verdict ?? "UNKNOWN", 40)} · ${escapeLabel(conclusion.grade ?? "UNKNOWN", 40)}`,
-			`Conclusion: ${escapeLabel(conclusion.conclusion)}`,
-			`Next: ${escapeLabel(conclusion.nextAction)}`,
-		])}"]:::${conclusionClass(conclusion.verdict)}`,
-		`  ${experimentNode} --> ${conclusionNode}`,
-	);
-	return 2;
+	return {
+		index: experiment.index,
+		id: experiment.id,
+		hypothesisId: experiment.hypothesisId,
+		sampleKind: experiment.sampleKind,
+		status: experiment.status,
+		variant: experimentClass(experiment),
+		request: request ? {
+			command: optionalText(request.command),
+			expectedSupports: optionalText(request.expectedSupports),
+			expectedRefutes: optionalText(request.expectedRefutes),
+			risk: optionalText(request.risk),
+			timeoutSeconds: typeof request.timeoutSeconds === "number" && Number.isFinite(request.timeoutSeconds)
+				? request.timeoutSeconds
+				: undefined,
+		} : undefined,
+		execution: execution ? {
+			exitCode: typeof execution.exitCode === "number" || typeof execution.exitCode === "string" ? execution.exitCode : undefined,
+			killed: typeof execution.killed === "boolean" ? execution.killed : undefined,
+		} : undefined,
+		conclusion: conclusion ? {
+			experimentId: experiment.id,
+			verdict: optionalText(conclusion.verdict) ?? "UNKNOWN",
+			grade: optionalText(conclusion.grade) ?? "UNKNOWN",
+			conclusion: optionalText(conclusion.conclusion) ?? "",
+			nextAction: optionalText(conclusion.nextAction) ?? "",
+			variant: conclusionClass(conclusion.verdict),
+		} : undefined,
+		files: {
+			request: flowFile(experiment.id, "request.json", experiment.files.request),
+			result: flowFile(experiment.id, "result.json", experiment.files.result),
+			stdout: flowFile(experiment.id, "stdout.txt", experiment.files.stdout),
+			stderr: flowFile(experiment.id, "stderr.txt", experiment.files.stderr),
+		},
+	};
 }
 
-export async function generateRunMermaid(runsRoot: string, runId: string): Promise<MermaidGenerationResult> {
-	const safeRunId = validateRunId(runId);
-	const view = await loadRunView(runsRoot, safeRunId);
-	const mermaid = renderRunMermaid(view);
-	const outputPath = join(resolve(runsRoot, safeRunId), "run.mmd");
-	await mkdir(resolve(runsRoot, safeRunId), { recursive: true });
-	const temporary = `${outputPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-	await writeFile(temporary, mermaid, "utf8");
-	await rename(temporary, outputPath);
-	const nodes = 1 + view.hypotheses.length + view.hypotheses.reduce((count, item) => count + item.experiments.length, 0) + view.orphanExperiments.length +
-		view.hypotheses.reduce((count, item) => count + item.experiments.filter((experiment) => experiment.result?.conclusion).length, 0) +
-		view.orphanExperiments.filter((experiment) => experiment.result?.conclusion).length;
-	return { outputPath, mermaid, warnings: view.warnings, nodes };
+export function buildFlowDocument(view: RunView): FlowDocument {
+	return {
+		run: {
+			id: String(view.run.id),
+			successCriterion: String(view.run.successCriterion),
+			workspace: String(view.run.workspace),
+			status: String(view.run.status),
+			variant: runClass(view.run.status),
+		},
+		hypotheses: view.hypotheses.map((hypothesis) => ({
+			index: hypothesis.index,
+			id: hypothesis.id,
+			statement: hypothesis.statement,
+			falsificationTest: hypothesis.falsificationTest,
+			status: hypothesis.status,
+			consecutiveFailures: hypothesis.consecutiveFailures,
+			variant: hypothesisClass(hypothesis.status),
+			experiments: hypothesis.experiments.map(buildFlowExperiment),
+		})),
+		orphanExperiments: view.orphanExperiments.map((experiment) => ({
+			...buildFlowExperiment(experiment),
+			variant: "error",
+		})),
+		warnings: [...view.warnings],
+	};
 }
+
+function safeInlineJson(value: unknown): string {
+	return JSON.stringify(value)
+		.replace(/&/g, "\\u0026")
+		.replace(/</g, "\\u003c")
+		.replace(/>/g, "\\u003e")
+		.replace(/\u2028/g, "\\u2028")
+		.replace(/\u2029/g, "\\u2029");
+}
+
+function escapeAttribute(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function renderRunFlowHtml(document: FlowDocument, assetUrls: ViewerAssets): string {
+	return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CTF Run ${escapeAttribute(document.run.id)}</title>
+<link rel="stylesheet" href="${escapeAttribute(assetUrls.stylesheet)}">
+</head>
+<body>
+<div id="root"></div>
+<script>window.__CTF_RUN_FLOW__=${safeInlineJson(document)};<\/script>
+<script src="${escapeAttribute(assetUrls.javascript)}"><\/script>
+</body>
+</html>
+`;
+}
+
+function relativeUrl(from: string, to: string): string {
+	return relative(from, to).split(sep).map((part) => part === ".." || part === "." ? part : encodeURIComponent(part)).join("/");
+}
+
+function countFlowNodes(document: FlowDocument): number {
+	const experiments = document.hypotheses.flatMap((hypothesis) => hypothesis.experiments).concat(document.orphanExperiments);
+	return 1 + document.hypotheses.length + experiments.length + experiments.filter((experiment) => experiment.conclusion).length;
+}
+
+export async function generateRunFlow(runsRoot: string, runId: string, viewerAssetsDir: string): Promise<FlowGenerationResult> {
+	const safeRunId = validateRunId(runId);
+	const assetsDir = resolve(viewerAssetsDir);
+	const javascriptPath = join(assetsDir, "viewer.js");
+	const stylesheetPath = join(assetsDir, "viewer.css");
+	if (!(await fileExists(javascriptPath)) || !(await fileExists(stylesheetPath))) {
+		throw new Error(`Flow viewer assets are missing in ${assetsDir}; run npm run build:viewer`);
+	}
+	const view = await loadRunView(runsRoot, safeRunId);
+	const document = buildFlowDocument(view);
+	const runDir = resolve(runsRoot, safeRunId);
+	const html = renderRunFlowHtml(document, {
+		javascript: relativeUrl(runDir, javascriptPath),
+		stylesheet: relativeUrl(runDir, stylesheetPath),
+	});
+	const outputPath = join(runDir, "run.html");
+	const temporary = `${outputPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+	await writeFile(temporary, html, "utf8");
+	await rename(temporary, outputPath);
+	return { outputPath, warnings: view.warnings, nodes: countFlowNodes(document) };
+}
+

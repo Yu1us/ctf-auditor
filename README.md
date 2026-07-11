@@ -26,10 +26,11 @@
 ```text
 .pi/extensions/ctf-auditor/
 ├── index.ts
-└── run-visualization.ts
+├── run-visualization.ts
+└── viewer/dist/          # React Flow 本地构建资源
 ```
 
-启动 Pi 后，扩展会注册 `ctf_run`、`ctf_experiment`、`ctf_conclude` 三个工具，以及 `/ctf` 命令。
+若从源码安装，先在项目根目录运行 `npm install` 和 `npm run build:viewer`。启动 Pi 后，扩展会注册 `ctf_run`、`ctf_experiment`、`ctf_conclude` 三个工具，以及 `/ctf` 命令。
 
 ## 使用流程
 
@@ -94,7 +95,7 @@
 | `/ctf status` | 显示当前审计状态。 |
 | `/ctf complete` | 经人工确认后完成运行。 |
 | `/ctf abort` | 中止当前运行。 |
-| `/ctf mermaid <run-id>` | 为指定运行生成 Mermaid 流程图。 |
+| `/ctf flow <run-id>` | 为指定运行生成可离线打开的 React Flow 回放页。 |
 
 ## 风险控制
 
@@ -119,4 +120,4 @@
     └── result.json
 ```
 
-`state.json` 保存运行状态；每个实验目录保存请求、原始输出、执行结果和结论。使用 `/ctf mermaid <run-id>` 会在对应运行目录中生成只读流程图文件 `run.mmd`，用于回放假设、实验与结论之间的关系。
+`state.json` 保存运行状态；每个实验目录保存请求、原始输出、执行结果和结论。使用 `/ctf flow <run-id>` 会生成 `run.html`，双击即可离线查看可缩放、可平移并带详情检查器的回放页；该操作不会修改审计状态或证据。

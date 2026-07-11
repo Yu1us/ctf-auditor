@@ -1,0 +1,5 @@
+::ffff:127.0.0.1 - - [11/Jul/2026 11:49:34] "GET /.pi/ctf-runs/20260711014134-0q6dms/run.html HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [11/Jul/2026 11:49:34] "GET /.pi/ctf-runs/20260711014134-0q6dms/viewer.css HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [11/Jul/2026 11:49:35] "GET /.pi/ctf-runs/20260711014134-0q6dms/viewer.js HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [11/Jul/2026 11:49:35] code 404, message File not found
+::ffff:127.0.0.1 - - [11/Jul/2026 11:49:35] "GET /favicon.ico HTTP/1.1" 404 -

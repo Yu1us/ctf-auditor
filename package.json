@@ -1,0 +1,21 @@
+{
+  "name": "ctf-auditor",
+  "private": true,
+  "scripts": {
+    "build:viewer": "vite build --config .pi/extensions/ctf-auditor/viewer/vite.config.ts",
+    "test": "tsx .dev/index.test.ts && tsx .dev/run-visualization.test.ts && tsx .dev/flow-graph.test.ts"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.8.5",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@types/node": "^24.3.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5"
+  }
+}

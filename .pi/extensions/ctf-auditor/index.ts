@@ -1,8 +1,9 @@
 import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { generateRunMermaid } from "./run-visualization.ts";
+import { generateRunFlow } from "./run-visualization.ts";
 
 export type Grade = "OBSERVED" | "DERIVED";
 export type Verdict = "SUPPORTS" | "REFUTES" | "INCONCLUSIVE";
@@ -67,7 +68,7 @@ const CTF_COMMAND_ARGUMENTS: AutocompleteItem[] = [
 	{ value: "abort", label: "abort", description: "Abort the active CTF run" },
 	{ value: "dev", label: "dev", description: "Disable CTF enforcement while developing this extension" },
 	{ value: "audit", label: "audit", description: "Re-enable the CTF audit workflow and enforcement" },
-	{ value: "mermaid", label: "mermaid", description: "Generate a Mermaid flowchart for a run id" },
+	{ value: "flow", label: "flow", description: "Generate an interactive React Flow page for a run id" },
 ];
 const SAMPLE_KINDS = ["REAL", "SYNTHETIC"] as const;
 const RISKS = ["LOW", "HIGH", "IRREVERSIBLE"] as const;
@@ -426,6 +427,7 @@ function widgetLine(state: State | undefined, developmentMode: boolean): string 
 }
 
 export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<void> {
+	const extensionDir = dirname(fileURLToPath(import.meta.url));
 	const codingAgent = await import("@earendil-works/pi-coding-agent");
 	const { StringEnum } = await import("@earendil-works/pi-ai");
 	const { Type } = await import("typebox");
@@ -538,15 +540,15 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	});
 
 	pi.registerCommand("ctf", {
-		description: "CTF audit controls: /ctf status|complete|abort|dev|audit|mermaid <run-id>",
+		description: "CTF audit controls: /ctf status|complete|abort|dev|audit|flow <run-id>",
 		getArgumentCompletions: (prefix) => {
 			const value = prefix.trimStart();
-			const mermaidMatch = value.match(/^mermaid\s+(.*)$/);
-			if (mermaidMatch) {
-				const query = mermaidMatch[1].trim();
+			const flowMatch = value.match(/^flow\s+(.*)$/);
+			if (flowMatch) {
+				const query = flowMatch[1].trim();
 				const items = knownRunIds
 					.filter((runId) => runId.startsWith(query))
-					.map((runId) => ({ value: `mermaid ${runId}`, label: runId, description: "Generate run.mmd" }));
+					.map((runId) => ({ value: `flow ${runId}`, label: runId, description: "Generate run.html" }));
 				return items.length > 0 ? items : null;
 			}
 			const items = CTF_COMMAND_ARGUMENTS.filter((item) => item.value.startsWith(value.trim()));
@@ -571,18 +573,18 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 				setDevelopmentMode(false, ctx);
 				ctx.ui.notify("CTF audit mode enabled: commands must use ctf_experiment.", "info");
 				return;
-			} else if (action.startsWith("mermaid")) {
-				const match = action.match(/^mermaid\s+(\S+)$/);
+			} else if (action.startsWith("flow")) {
+				const match = action.match(/^flow\s+(\S+)$/);
 				if (!match) {
-					ctx.ui.notify("Usage: /ctf mermaid <run-id>", "warning");
+					ctx.ui.notify("Usage: /ctf flow <run-id>", "warning");
 					return;
 				}
-				const generated = await generateRunMermaid(runsRoot, match[1]);
+				const generated = await generateRunFlow(runsRoot, match[1], join(extensionDir, "viewer", "dist"));
 				knownRunIds = [...new Set(knownRunIds.concat(match[1]))].sort();
 				const warningText = generated.warnings.length > 0 ? `\nWarnings (${generated.warnings.length}):\n${generated.warnings.join("\n")}` : "";
-				ctx.ui.notify(`Generated ${generated.nodes} Mermaid nodes:\n${generated.outputPath}${warningText}`, generated.warnings.length > 0 ? "warning" : "info");
+				ctx.ui.notify(`Generated ${generated.nodes} React Flow nodes:\n${generated.outputPath}${warningText}`, generated.warnings.length > 0 ? "warning" : "info");
 				return;
-			} else ctx.ui.notify("Usage: /ctf status|complete|abort|dev|audit|mermaid <run-id>", "warning");
+			} else ctx.ui.notify("Usage: /ctf status|complete|abort|dev|audit|flow <run-id>", "warning");
 			refreshWidget(ctx);
 		},
 	});
