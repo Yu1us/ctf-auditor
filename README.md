@@ -8,21 +8,21 @@
 假设 → 有成功/失败判据的真实实验 → 原始输出 → 结论 → 下一步
 ```
 
-默认仅用于合法 CTF、靶场和用户明确授权的环境。不读取或推断隐藏思维链。
+默认仅用于合法 CTF、靶场和用户明确授权的环境。
 
 ## 必须保证
 
 1. 初始化时记录最小成功指标和工作区。
 2. 同时最多 3 个活跃假设；每个假设必须可证伪。
-3. 默认采用 balanced 策略：先做低成本验证，再扩大实验范围；命令只能通过 `ctf_experiment` 执行。
+3. 默认先做低成本验证，再扩大实验范围；命令只能通过 `ctf_experiment` 执行。
 4. 上一实验未归纳前禁止下一实验。
-5. 完整 stdout/stderr、命令、cwd、退出码和时间落盘；模型只接收截断结果。
+5. 完整 stdout/stderr、命令和退出码落盘；模型只接收截断结果。
 6. 合成测试不能产生 `OBSERVED` 结论；生成代码本身不算证据。
-7. 同一假设连续两次 `REFUTES` 或无新增信息的 `INCONCLUSIVE` 后要求 replan。
+7. 同一假设连续两次 `REFUTES` 或 `INCONCLUSIVE` 后要求 replan。
 8. “高风险”主要指证据不足时进行高耗时、高资源或过深探索；这类实验必须人工批准。不可逆操作同样需要批准，路径越界始终拒绝。
 9. 人工确认前不能把 run 标记为完成。
 
-其余评分、Dashboard、远程后端、通用 Gate、reviewer LLM 和多模式策略暂不实现。MVP 只实现 balanced，不增加模式切换。
+其余评分、Dashboard、远程后端、通用 Gate、reviewer LLM 和多模式策略暂不实现。
 
 ## 最小代码结构
 
@@ -46,7 +46,7 @@
     └── result.json
 ```
 
-`state.json` 用临时文件 + rename 原子更新。实验请求和结果以实验目录为准，无需额外事件日志，也不为 hypothesis、claim、artifact 分别建立 ledger。
+`state.json` 用临时文件 + rename 原子更新，只保存状态机所需索引。实验请求、执行结果和结论以实验目录为准，无需额外事件日志，也不为 hypothesis、claim、artifact 分别建立 ledger。
 
 ## 最小数据模型
 
@@ -60,11 +60,7 @@ interface ExperimentRequest {
   expectedSupports: string;
   expectedRefutes: string;
   sampleKind: "REAL" | "SYNTHETIC";
-  evidenceExperimentIds: string[];
-  evidenceBasis: string;
-  estimatedCost: "LOW" | "HIGH";
-  explorationDepth: "PROBE" | "DEEP";
-  irreversible: boolean;
+  risk: "LOW" | "HIGH" | "IRREVERSIBLE";
   timeoutSeconds: number;
 }
 
@@ -84,15 +80,9 @@ interface State {
   }>;
   experiments: Array<{
     id: string;
-    request: ExperimentRequest;
+    hypothesisId: string;
+    sampleKind: "REAL" | "SYNTHETIC";
     status: "RUNNING" | "AWAITING_CONCLUSION" | "CLOSED";
-    result?: { exitCode: number };
-    conclusion?: {
-      verdict: Verdict;
-      observations: string[];
-      claims: Array<{ statement: string; grade: Grade }>;
-      nextAction: string;
-    };
   }>;
   seq: number;
 }
@@ -108,8 +98,8 @@ interface State {
 
 - `init`：要求成功指标和工作区。
 - `add_hypothesis`：要求 statement 和 falsificationTest。
-- `replan`：记录理由，清除 `REPLAN_REQUIRED`。
-- `status`：返回当前假设、待归纳实验和成功指标。
+- `replan`：清除 `REPLAN_REQUIRED`。
+- `status`：返回当前假设、待归纳实验、最近结论、下一步和成功指标。
 
 ### `ctf_experiment`
 
@@ -122,25 +112,22 @@ interface State {
   expectedSupports: string;
   expectedRefutes: string;
   sampleKind: "REAL" | "SYNTHETIC";
-  evidenceExperimentIds: string[];
-  evidenceBasis: string;
-  estimatedCost: "LOW" | "HIGH";
-  explorationDepth: "PROBE" | "DEEP";
-  irreversible: boolean;
+  risk: "LOW" | "HIGH" | "IRREVERSIBLE";
   timeoutSeconds: number;
 }
 ```
 
-执行顺序：校验状态和证据引用 → 判定是否审批 → 在授权 cwd 执行 → 完整输出落盘 → 返回截断摘要 → 状态改为 `AWAITING_CONCLUSION`。
+执行顺序：校验状态 → 判定是否审批 → 在授权工作区执行 → 完整输出落盘 → 返回截断摘要 → 状态改为 `AWAITING_CONCLUSION`。
 
-balanced 风险规则：
+风险规则：
 
-- `LOW + PROBE + 可逆`：直接执行；读取、搜索、短时局部验证默认属于此类。
-- `HIGH` 或 `DEEP`：若没有引用相关、已关闭的真实实验，视为证据不足，必须人工批准；无 UI 时拒绝。
-- 不可逆操作始终需要批准；授权工作区外的操作始终拒绝，不能靠批准放行。
-- 风险不按“命令看起来危险”判断，而按错误方向上的预期时间、CPU、网络、磁盘、影响范围和回退成本判断。
+- `LOW`：直接执行；读取、搜索、短时局部验证默认属于此类。
+- `HIGH`：若同一假设没有已关闭的真实实验，视为证据不足，必须人工批准；无 UI 时拒绝。
+- `IRREVERSIBLE`：始终需要批准。
+- 授权工作区外的操作始终拒绝，不能靠批准放行。
+- `HIGH` 包含高耗时、高资源或过深探索；风险不按“命令看起来危险”判断，而按错误方向上的预期时间、CPU、网络、磁盘、影响范围和回退成本判断。
 
-引用只验证实验存在且已关闭，不让扩展猜测语义相关性；模型给出的依据和成本声明一并落盘，供人工审批和事后审计。使用 Pi/Node 现有进程执行和截断能力，不自行实现 shell parser、进程树管理或日志框架。
+扩展直接从状态判断同一假设是否已有真实实验，不要求模型提交证据引用或说明。使用 Pi/Node 现有进程执行和截断能力，不自行实现 shell parser、进程树管理或日志框架。
 
 ### `ctf_conclude`
 
@@ -150,8 +137,8 @@ balanced 风险规则：
 {
   experimentId: string;
   verdict: Verdict;
-  observations: string[];
-  claims: Array<{ statement: string; grade: Grade }>;
+  grade: Grade;
+  conclusion: string;
   nextAction: string;
 }
 ```
@@ -159,8 +146,8 @@ balanced 风险规则：
 规则：
 
 - 只能归纳当前待处理实验；
-- `SYNTHETIC` 的 claim 只能为 `DERIVED`；
-- 关闭实验并更新假设；连续失败 2 次进入 `REPLAN_REQUIRED`。
+- `SYNTHETIC` 的结论只能为 `DERIVED`；
+- 将结论写入 `result.json`，关闭实验并更新假设；连续失败 2 次进入 `REPLAN_REQUIRED`。
 
 ### `/ctf`
 
@@ -177,7 +164,7 @@ balanced 风险规则：
 ## 必要 Hooks
 
 - `session_start`：加载 state，移除内置 `bash` 并显示 Widget，确保所有命令经过 balanced 风险门。
-- `before_agent_start`：注入当前成功指标、活跃假设和阻塞原因。
+- `before_agent_start`：注入当前成功指标、活跃假设、最近结论、下一步和阻塞原因。
 - `tool_call`：阻止授权工作区外的 `write/edit`，并拒绝未知执行型工具。
 - `session_shutdown`：flush 状态并恢复原 active tools。
 
