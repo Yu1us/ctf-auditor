@@ -1,1 +1,4 @@
-.pi/
+.pi/*
+!.pi/extensions/
+.pi/extensions/*
+!.pi/extensions/ctf-auditor/
