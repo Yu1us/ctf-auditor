@@ -12,8 +12,8 @@
 
 - 初始化时记录成功标准和授权工作区。
 - 最多同时维护 3 个可证伪假设。
-- 命令统一经 `ctf_experiment` 执行；每次实验必须绑定假设及 supports/refutes 判据。
-- 上一个实验归纳完成前，不能开始下一个实验。
+- 低风险探索命令经 `ctf_trace` 连续执行并自动留存；关键验证才使用 `ctf_experiment` 绑定假设及 supports/refutes 判据。
+- 上一个正式实验归纳完成前，不能开始下一个正式实验；普通 trace 不需要逐条归纳。
 - 完整保存命令、退出码、stdout 和 stderr；返回给模型的输出会截断。
 - 合成样本不能得出 `OBSERVED`（观察到的）结论。
 - 同一假设连续两次得到 `REFUTES` 或 `INCONCLUSIVE` 后，必须重新规划。
@@ -36,8 +36,8 @@
 
 1. 通过 `ctf_run` 的 `init` 动作提供成功标准和已授权的工作区。
 2. 用 `add_hypothesis` 添加可证伪假设，说明其证伪方法。
-3. 用 `ctf_experiment` 执行一个低风险验证，并明确什么结果支持或证伪假设。
-4. 立刻用 `ctf_conclude` 记录结论和下一步。
+3. 用 `ctf_trace` 完成文件定位、搜索和短时静态检查；当结果会改变路线或验证关键漏洞时，改用 `ctf_experiment` 并明确支持/证伪判据。
+4. 正式实验后立刻用 `ctf_conclude` 记录结论和下一步。
 5. 达到成功标准后，以 `/ctf complete` 完成运行；该操作需要人工确认。
 
 ### 工具
@@ -53,6 +53,20 @@
 | `park_hypothesis` | 暂停一个活跃假设。 |
 | `replan` | 在要求重新规划后恢复运行。 |
 | `status` | 查看运行、假设、待归纳实验和下一步。 |
+
+#### `ctf_trace`
+
+用于工作区内低风险、短时、易回退的探索命令：
+
+```ts
+{
+  command: "...",
+  purpose: "本次探索的目的",
+  timeoutSeconds: 30
+}
+```
+
+trace 会完整保存命令和输出，但不更新假设状态，也不需要调用 `ctf_conclude`。网络目标访问、高成本、不可逆或会决定解题路线的验证必须使用 `ctf_experiment`。
 
 #### `ctf_experiment`
 
@@ -104,7 +118,7 @@
 - `IRREVERSIBLE`：始终需要人工批准。
 - 授权工作区外的路径始终被拒绝，批准不能绕过此限制。
 
-审计模式下，内置 `bash` 不可直接使用，所有命令必须经 `ctf_experiment` 执行。
+审计模式下，内置 `bash` 不可直接使用；普通低风险探索经 `ctf_trace` 执行，关键验证经 `ctf_experiment` 执行。
 
 ## 运行记录与可视化
 

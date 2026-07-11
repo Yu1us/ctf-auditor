@@ -10,6 +10,12 @@ export type Verdict = "SUPPORTS" | "REFUTES" | "INCONCLUSIVE";
 export type SampleKind = "REAL" | "SYNTHETIC";
 export type Risk = "LOW" | "HIGH" | "IRREVERSIBLE";
 
+export interface TraceRequest {
+	command: string;
+	purpose: string;
+	timeoutSeconds: number;
+}
+
 export interface ExperimentRequest {
 	hypothesisId: string;
 	command: string;
@@ -27,6 +33,10 @@ export interface State {
 		workspace: string;
 		status: "ACTIVE" | "REPLAN_REQUIRED" | "COMPLETE" | "ABORTED";
 	};
+	traces: Array<{
+		id: string;
+		status: "RUNNING" | "CLOSED";
+	}>;
 	hypotheses: Array<{
 		id: string;
 		statement: string;
@@ -41,6 +51,7 @@ export interface State {
 		status: "RUNNING" | "AWAITING_CONCLUSION" | "CLOSED";
 	}>;
 	seq: number;
+	traceSeq: number;
 }
 
 interface ExecutionResult {
@@ -75,7 +86,7 @@ const RISKS = ["LOW", "HIGH", "IRREVERSIBLE"] as const;
 const VERDICTS = ["SUPPORTS", "REFUTES", "INCONCLUSIVE"] as const;
 const GRADES = ["OBSERVED", "DERIVED"] as const;
 const SAFE_TOOL_NAMES = new Set(["read", "grep", "find", "ls", "write", "edit", "question", "questionnaire", "ask_user_question"]);
-const AUDITOR_TOOL_NAMES = ["ctf_run", "ctf_experiment", "ctf_conclude"];
+const AUDITOR_TOOL_NAMES = ["ctf_run", "ctf_trace", "ctf_experiment", "ctf_conclude"];
 const WIDGET_ID = "ctf-auditor";
 const MODE_ENTRY_TYPE = "ctf-auditor-mode";
 const DEFAULT_MAX_BYTES = 50 * 1024;
@@ -130,6 +141,10 @@ async function canonicalize(path: string): Promise<string> {
 	}
 }
 
+function traceNeedsExperiment(command: string): boolean {
+	return /(?:^|\s)(?:curl|wget|ssh|scp|nc|ncat|telnet|nmap|masscan|sqlmap)\b|https?:\/\/|(?:^|\s)(?:rm\s+-rf|shutdown|reboot|format)\b/i.test(command);
+}
+
 function commandHasObviousEscape(command: string): boolean {
 	if (command.includes("\0")) return true;
 	if (/(^|[\s'"=])\.\.([\\/]|$)/.test(command)) return true;
@@ -167,7 +182,10 @@ export class CtfAuditor {
 			const statePath = join(this.runsRoot, entry.name, "state.json");
 			try {
 				const [raw, info] = await Promise.all([readFile(statePath, "utf8"), stat(statePath)]);
-				candidates.push({ dir: join(this.runsRoot, entry.name), mtime: info.mtimeMs, state: JSON.parse(raw) as State });
+				const state = JSON.parse(raw) as State;
+				state.traces ??= [];
+				state.traceSeq ??= state.traces.length;
+				candidates.push({ dir: join(this.runsRoot, entry.name), mtime: info.mtimeMs, state });
 			} catch {
 				// Ignore incomplete or unrelated directories.
 			}
@@ -190,9 +208,11 @@ export class CtfAuditor {
 		this.runDir = join(this.runsRoot, id);
 		this.state = {
 			run: { id, successCriterion: criterion, workspace: canonicalWorkspace, status: "ACTIVE" },
+			traces: [],
 			hypotheses: [],
 			experiments: [],
 			seq: 0,
+			traceSeq: 0,
 		};
 		await this.save();
 		return this.state;
@@ -236,6 +256,51 @@ export class CtfAuditor {
 		state.run.status = "ACTIVE";
 		for (const hypothesis of state.hypotheses) hypothesis.consecutiveFailures = 0;
 		await this.save();
+	}
+
+	async trace(request: TraceRequest, signal?: AbortSignal): Promise<{ traceId: string; summary: string }> {
+		return this.exclusive(() => this.runTrace(request, signal));
+	}
+
+	private async runTrace(request: TraceRequest, signal?: AbortSignal): Promise<{ traceId: string; summary: string }> {
+		const state = this.requireActive();
+		required(request.command, "command");
+		required(request.purpose, "purpose");
+		if (!Number.isFinite(request.timeoutSeconds) || request.timeoutSeconds <= 0) throw new Error("timeoutSeconds must be positive");
+		if (commandHasObviousEscape(request.command)) throw new Error("Command contains a path outside the authorized workspace");
+		if (traceNeedsExperiment(request.command)) throw new Error("Command exceeds LOW-risk trace scope; use ctf_experiment");
+
+		const canonicalWorkspace = await realpath(state.run.workspace);
+		if (!isWithin(state.run.workspace, canonicalWorkspace)) throw new Error("Authorized workspace no longer resolves safely");
+		state.traceSeq += 1;
+		const traceId = `T${String(state.traceSeq).padStart(4, "0")}`;
+		const traceDir = join(this.requireRunDir(), "traces", traceId);
+		await mkdir(traceDir, { recursive: true });
+		await writeFile(join(traceDir, "request.json"), `${JSON.stringify(request, null, 2)}\n`, "utf8");
+		state.traces.push({ id: traceId, status: "RUNNING" });
+		await this.save();
+
+		let execution: ExecutionResult;
+		try {
+			execution = await this.executor(request.command, canonicalWorkspace, request.timeoutSeconds * 1000, signal);
+		} catch (error) {
+			execution = { stdout: "", stderr: error instanceof Error ? error.message : String(error), code: -1, killed: true };
+		}
+		await Promise.all([
+			writeFile(join(traceDir, "stdout.txt"), execution.stdout, "utf8"),
+			writeFile(join(traceDir, "stderr.txt"), execution.stderr, "utf8"),
+		]);
+		await writeFile(join(traceDir, "result.json"), `${JSON.stringify({ execution: { command: request.command, exitCode: execution.code, killed: execution.killed } }, null, 2)}\n`, "utf8");
+		state.traces.find((item) => item.id === traceId)!.status = "CLOSED";
+		await this.save();
+
+		const combined = [`exitCode: ${execution.code}`, execution.stdout && `stdout:\n${execution.stdout}`, execution.stderr && `stderr:\n${execution.stderr}`]
+			.filter(Boolean)
+			.join("\n");
+		const truncated = truncateCommandOutput(combined, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+		let summary = truncated.content;
+		if (truncated.truncated) summary += `\n\n[Output truncated. Full output: ${traceDir}]`;
+		return { traceId, summary };
 	}
 
 	async experiment(request: ExperimentRequest, signal?: AbortSignal): Promise<{ experimentId: string; summary: string }> {
@@ -498,11 +563,29 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	});
 
 	pi.registerTool({
+		name: "ctf_trace",
+		label: "CTF Trace",
+		description: `Run a LOW-risk exploratory command without creating a formal conclusion. Full output is saved on disk; model output is truncated.`,
+		promptSnippet: "Run short, LOW-risk exploration without formal hypothesis bookkeeping",
+		promptGuidelines: ["Use ctf_trace for file discovery, environment checks, searches, and short local static checks. Upgrade decision-changing, networked, costly, or irreversible validation to ctf_experiment."],
+		parameters: Type.Object({
+			command: Type.String(),
+			purpose: Type.String(),
+			timeoutSeconds: Type.Number({ minimum: 1 }),
+		}),
+		async execute(_id, params, signal, _update, ctx) {
+			const result = await auditor.trace(params, signal);
+			refreshWidget(ctx);
+			return textResult(`${result.traceId}\n${result.summary}`, result);
+		},
+	});
+
+	pi.registerTool({
 		name: "ctf_experiment",
 		label: "CTF Experiment",
 		description: `Run one hypothesis-bound command in the authorized workspace. Full output is saved on disk; model output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
 		promptSnippet: "Run a real, falsifiable CTF experiment with supports/refutes criteria",
-		promptGuidelines: ["Run commands only through ctf_experiment, starting with LOW-risk local probes, and conclude each experiment before another."],
+		promptGuidelines: ["Use ctf_experiment only for decision-changing or key validation, and conclude each formal experiment before another. Use ctf_trace for ordinary LOW-risk exploration."],
 		parameters: Type.Object({
 			hypothesisId: Type.String(),
 			command: Type.String(),
@@ -571,7 +654,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 				return;
 			} else if (action === "audit") {
 				setDevelopmentMode(false, ctx);
-				ctx.ui.notify("CTF audit mode enabled: commands must use ctf_experiment.", "info");
+				ctx.ui.notify("CTF audit mode enabled: commands must use ctf_trace or ctf_experiment.", "info");
 				return;
 			} else if (action.startsWith("flow")) {
 				const match = action.match(/^flow\s+(\S+)$/);
@@ -617,7 +700,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 		return {
 			message: {
 				customType: "ctf-auditor-context",
-				content: `[CTF AUDIT CONTROL]\n${status}\n\nAll commands must use ctf_experiment. Every experiment needs explicit supports/refutes criteria and must be concluded before the next experiment.`,
+				content: `[CTF AUDIT CONTROL]\n${status}\n\nAudit decisions, not individual commands. Use ctf_trace for LOW-risk file discovery, searches, environment checks, shell correction, and short local static checks; traces need no hypothesis or conclusion. Use ctf_experiment when a result changes the solution route, validates a key vulnerability/exploit/flag, accesses a real network target, or has meaningful cost/risk. Keep incremental checks on one hypothesis. Every formal experiment needs supports/refutes criteria and must be concluded before the next formal experiment.`,
 				display: false,
 			},
 		};
@@ -625,7 +708,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 
 	pi.on("tool_call", async (event) => {
 		if (developmentMode) return;
-		if (event.toolName === "bash") return { block: true, reason: "Use ctf_experiment for all commands" };
+		if (event.toolName === "bash") return { block: true, reason: "Use ctf_trace for LOW-risk exploration or ctf_experiment for key validation" };
 		if (event.toolName === "write" || event.toolName === "edit") {
 			const path = (event.input as { path?: unknown }).path;
 			if (typeof path !== "string" || !(await auditor.isAuthorizedPath(path))) {

@@ -41,6 +41,14 @@ async function main(): Promise<void> {
 
 		const first = await auditor.experiment(request(h1, { sampleKind: "SYNTHETIC" }));
 		await rejects(() => auditor.experiment(request(h1)), /Conclude the previous/);
+		const trace = await auditor.trace({ command: "list-files", purpose: "locate challenge files", timeoutSeconds: 5 });
+		assert.equal(trace.traceId, "T0001");
+		assert.match(trace.summary, /output:list-files/);
+		assert.equal(auditor.state?.hypotheses.find((item) => item.id === h1)?.consecutiveFailures, 0);
+		await rejects(
+			() => auditor.trace({ command: "curl https://target.invalid", purpose: "probe target", timeoutSeconds: 5 }),
+			/use ctf_experiment/,
+		);
 		await rejects(
 			() => auditor.conclude({
 				experimentId: first.experimentId,
@@ -108,9 +116,13 @@ async function main(): Promise<void> {
 		await resumed.load();
 		assert.equal(resumed.state?.run.id, "test-run");
 		assert.equal(resumed.state?.experiments.length, 4);
+		assert.equal(resumed.state?.traces.length, 1);
+		assert.equal(resumed.state?.traces[0].status, "CLOSED");
 		assert.equal(resumed.state?.experiments.every((item) => item.status === "CLOSED"), true);
 		assert.match(await resumed.statusText(), /request human completion confirmation/);
 
+		const traceStdout = await readFile(join(runsRoot, "test-run", "traces", trace.traceId, "stdout.txt"), "utf8");
+		assert.equal(traceStdout, "output:list-files\n");
 		const stdout = await readFile(join(runsRoot, "test-run", "experiments", low.experimentId, "stdout.txt"), "utf8");
 		const result = JSON.parse(await readFile(join(runsRoot, "test-run", "experiments", low.experimentId, "result.json"), "utf8"));
 		assert.equal(stdout, "output:local-probe\n");
