@@ -64,13 +64,17 @@ const CTF_COMMAND_ARGUMENTS: AutocompleteItem[] = [
 	{ value: "status", label: "status", description: "Show the current CTF audit status" },
 	{ value: "complete", label: "complete", description: "Mark the active CTF run as complete" },
 	{ value: "abort", label: "abort", description: "Abort the active CTF run" },
+	{ value: "dev", label: "dev", description: "Disable CTF enforcement while developing this extension" },
+	{ value: "audit", label: "audit", description: "Re-enable the CTF audit workflow and enforcement" },
 ];
 const SAMPLE_KINDS = ["REAL", "SYNTHETIC"] as const;
 const RISKS = ["LOW", "HIGH", "IRREVERSIBLE"] as const;
 const VERDICTS = ["SUPPORTS", "REFUTES", "INCONCLUSIVE"] as const;
 const GRADES = ["OBSERVED", "DERIVED"] as const;
 const SAFE_TOOL_NAMES = new Set(["read", "grep", "find", "ls", "write", "edit", "question", "questionnaire", "ask_user_question"]);
+const AUDITOR_TOOL_NAMES = ["ctf_run", "ctf_experiment", "ctf_conclude"];
 const WIDGET_ID = "ctf-auditor";
+const MODE_ENTRY_TYPE = "ctf-auditor-mode";
 const DEFAULT_MAX_BYTES = 50 * 1024;
 const DEFAULT_MAX_LINES = 2000;
 
@@ -411,7 +415,8 @@ export class CtfAuditor {
 	}
 }
 
-function widgetLine(state: State | undefined): string {
+function widgetLine(state: State | undefined, developmentMode: boolean): string {
+	if (developmentMode) return "CTF auditor: DEVELOPMENT MODE | standard tools enabled | /ctf audit to re-enable enforcement";
 	if (!state) return "CTF: not initialized";
 	const active = state.hypotheses.filter((item) => item.status === "ACTIVE").length;
 	const pending = state.experiments.find((item) => item.status !== "CLOSED")?.id ?? "none";
@@ -428,8 +433,38 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	let auditor: CtfAuditor;
 	let toolsBeforeSession: string[] | undefined;
 	let currentContext: ExtensionContext | undefined;
+	let developmentMode = false;
 
-	const refreshWidget = (ctx: ExtensionContext): void => ctx.ui.setWidget(WIDGET_ID, [widgetLine(auditor?.state)]);
+	const refreshWidget = (ctx: ExtensionContext): void => ctx.ui.setWidget(WIDGET_ID, [widgetLine(auditor?.state, developmentMode)]);
+	const applyToolMode = (): void => {
+		const standardTools = (toolsBeforeSession ?? pi.getActiveTools()).filter((name) => !AUDITOR_TOOL_NAMES.includes(name));
+		if (developmentMode) {
+			pi.setActiveTools(standardTools);
+			return;
+		}
+		pi.setActiveTools([...new Set(standardTools.filter((name) => name !== "bash").concat(AUDITOR_TOOL_NAMES))]);
+	};
+	const restoreModeFromSession = (ctx: ExtensionContext): boolean | undefined => {
+		for (const rawEntry of [...ctx.sessionManager.getBranch()].reverse()) {
+			const entry = rawEntry as { type?: string; customType?: string; data?: { mode?: unknown } };
+			if (entry.type !== "custom" || entry.customType !== MODE_ENTRY_TYPE) continue;
+			if (entry.data?.mode === "development") return true;
+			if (entry.data?.mode === "audit") return false;
+		}
+		return undefined;
+	};
+	const setDevelopmentMode = (enabled: boolean, ctx: ExtensionContext): void => {
+		developmentMode = enabled;
+		pi.appendEntry(MODE_ENTRY_TYPE, { mode: enabled ? "development" : "audit" });
+		applyToolMode();
+		refreshWidget(ctx);
+	};
+
+	pi.registerFlag("ctf-dev", {
+		description: "Start CTF Auditor in development mode without CTF workflow enforcement",
+		type: "boolean",
+		default: false,
+	});
 	const textResult = (text: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text }], details });
 
 	pi.registerTool({
@@ -499,7 +534,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	});
 
 	pi.registerCommand("ctf", {
-		description: "CTF audit status, completion, or abort: /ctf status|complete|abort",
+		description: "CTF audit controls: /ctf status|complete|abort|dev|audit",
 		getArgumentCompletions: (prefix) => {
 			const items = CTF_COMMAND_ARGUMENTS.filter((item) => item.value.startsWith(prefix.trim()));
 			return items.length > 0 ? items : null;
@@ -515,7 +550,15 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 			} else if (action === "abort") {
 				await auditor.setTerminalStatus("ABORTED");
 				ctx.ui.notify("CTF run aborted", "warning");
-			} else ctx.ui.notify("Usage: /ctf status|complete|abort", "warning");
+			} else if (action === "dev") {
+				setDevelopmentMode(true, ctx);
+				ctx.ui.notify("CTF development mode enabled: standard tools restored and CTF workflow enforcement paused.", "warning");
+				return;
+			} else if (action === "audit") {
+				setDevelopmentMode(false, ctx);
+				ctx.ui.notify("CTF audit mode enabled: commands must use ctf_experiment.", "info");
+				return;
+			} else ctx.ui.notify("Usage: /ctf status|complete|abort|dev|audit", "warning");
 			refreshWidget(ctx);
 		},
 	});
@@ -523,6 +566,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	pi.on("session_start", async (_event, ctx) => {
 		currentContext = ctx;
 		toolsBeforeSession = pi.getActiveTools();
+		developmentMode = Boolean(pi.getFlag("ctf-dev")) || restoreModeFromSession(ctx) === true;
 		const invocationExecutor: Executor = async (command, workspace, timeoutMs, signal) => {
 			const shell = shellInvocation(command);
 			return pi.exec(shell.program, shell.args, { cwd: workspace, timeout: timeoutMs, signal });
@@ -532,11 +576,12 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 			: undefined;
 		auditor = new CtfAuditor(join(ctx.cwd, configDirName, "ctf-runs"), invocationExecutor, approver);
 		await auditor.load();
-		pi.setActiveTools([...new Set(toolsBeforeSession.filter((name) => name !== "bash").concat(["ctf_run", "ctf_experiment", "ctf_conclude"]))]);
+		applyToolMode();
 		refreshWidget(ctx);
 	});
 
 	pi.on("before_agent_start", async () => {
+		if (developmentMode) return;
 		const status = await auditor.statusText();
 		return {
 			message: {
@@ -548,6 +593,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	});
 
 	pi.on("tool_call", async (event) => {
+		if (developmentMode) return;
 		if (event.toolName === "bash") return { block: true, reason: "Use ctf_experiment for all commands" };
 		if (event.toolName === "write" || event.toolName === "edit") {
 			const path = (event.input as { path?: unknown }).path;

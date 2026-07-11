@@ -151,21 +151,27 @@ interface State {
 
 ### `/ctf`
 
-只保留：
-
 ```text
 /ctf status
 /ctf complete
 /ctf abort
+/ctf dev
+/ctf audit
 ```
 
 `complete` 需要有 UI 的人工确认；无 UI 拒绝。状态展示使用一行 `setWidget()`，不写自定义 TUI 组件。
 
+### 开发模式
+
+开发 Extension 本身时，使用 `/ctf dev`；它会恢复启动前的标准工具、停止注入 CTF 工作流提示，并暂停所有 CTF 工具调用拦截。该选择作为 session entry 保存，因此 `/reload` 后仍然生效。用 `/ctf audit` 恢复审计模式。
+
+也可通过 `pi --ctf-dev` 直接启动开发模式；此 CLI flag 在当前进程中优先于 session 设置。开发模式只用于改造/调试该 Extension，不应在真实 CTF 审计中启用。
+
 ## 必要 Hooks
 
-- `session_start`：加载 state，移除内置 `bash` 并显示 Widget，确保所有命令经过 balanced 风险门。
-- `before_agent_start`：注入当前成功指标、活跃假设、最近结论、下一步和阻塞原因。
-- `tool_call`：阻止授权工作区外的 `write/edit`，并拒绝未知执行型工具。
+- `session_start`：加载 state；审计模式移除内置 `bash` 并显示 Widget，确保所有命令经过 balanced 风险门；开发模式恢复标准工具。
+- `before_agent_start`：仅审计模式注入当前成功指标、活跃假设、最近结论、下一步和阻塞原因。
+- `tool_call`：仅审计模式阻止授权工作区外的 `write/edit`，并拒绝未知执行型工具。
 - `session_shutdown`：flush 状态并恢复原 active tools。
 
 不接入其余生命周期事件；工具执行记录已由 `ctf_experiment` 完成。
