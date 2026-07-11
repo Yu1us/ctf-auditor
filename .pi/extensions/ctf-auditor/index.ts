@@ -2,6 +2,7 @@ import { mkdir, readFile, readdir, realpath, rename, stat, writeFile } from "nod
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { generateRunMermaid } from "./run-visualization.ts";
 
 export type Grade = "OBSERVED" | "DERIVED";
 export type Verdict = "SUPPORTS" | "REFUTES" | "INCONCLUSIVE";
@@ -66,6 +67,7 @@ const CTF_COMMAND_ARGUMENTS: AutocompleteItem[] = [
 	{ value: "abort", label: "abort", description: "Abort the active CTF run" },
 	{ value: "dev", label: "dev", description: "Disable CTF enforcement while developing this extension" },
 	{ value: "audit", label: "audit", description: "Re-enable the CTF audit workflow and enforcement" },
+	{ value: "mermaid", label: "mermaid", description: "Generate a Mermaid flowchart for a run id" },
 ];
 const SAMPLE_KINDS = ["REAL", "SYNTHETIC"] as const;
 const RISKS = ["LOW", "HIGH", "IRREVERSIBLE"] as const;
@@ -434,6 +436,8 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	let toolsBeforeSession: string[] | undefined;
 	let currentContext: ExtensionContext | undefined;
 	let developmentMode = false;
+	let runsRoot = "";
+	let knownRunIds: string[] = [];
 
 	const refreshWidget = (ctx: ExtensionContext): void => ctx.ui.setWidget(WIDGET_ID, [widgetLine(auditor?.state, developmentMode)]);
 	const applyToolMode = (): void => {
@@ -534,9 +538,18 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	});
 
 	pi.registerCommand("ctf", {
-		description: "CTF audit controls: /ctf status|complete|abort|dev|audit",
+		description: "CTF audit controls: /ctf status|complete|abort|dev|audit|mermaid <run-id>",
 		getArgumentCompletions: (prefix) => {
-			const items = CTF_COMMAND_ARGUMENTS.filter((item) => item.value.startsWith(prefix.trim()));
+			const value = prefix.trimStart();
+			const mermaidMatch = value.match(/^mermaid\s+(.*)$/);
+			if (mermaidMatch) {
+				const query = mermaidMatch[1].trim();
+				const items = knownRunIds
+					.filter((runId) => runId.startsWith(query))
+					.map((runId) => ({ value: `mermaid ${runId}`, label: runId, description: "Generate run.mmd" }));
+				return items.length > 0 ? items : null;
+			}
+			const items = CTF_COMMAND_ARGUMENTS.filter((item) => item.value.startsWith(value.trim()));
 			return items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
@@ -558,7 +571,18 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 				setDevelopmentMode(false, ctx);
 				ctx.ui.notify("CTF audit mode enabled: commands must use ctf_experiment.", "info");
 				return;
-			} else ctx.ui.notify("Usage: /ctf status|complete|abort|dev|audit", "warning");
+			} else if (action.startsWith("mermaid")) {
+				const match = action.match(/^mermaid\s+(\S+)$/);
+				if (!match) {
+					ctx.ui.notify("Usage: /ctf mermaid <run-id>", "warning");
+					return;
+				}
+				const generated = await generateRunMermaid(runsRoot, match[1]);
+				knownRunIds = [...new Set(knownRunIds.concat(match[1]))].sort();
+				const warningText = generated.warnings.length > 0 ? `\nWarnings (${generated.warnings.length}):\n${generated.warnings.join("\n")}` : "";
+				ctx.ui.notify(`Generated ${generated.nodes} Mermaid nodes:\n${generated.outputPath}${warningText}`, generated.warnings.length > 0 ? "warning" : "info");
+				return;
+			} else ctx.ui.notify("Usage: /ctf status|complete|abort|dev|audit|mermaid <run-id>", "warning");
 			refreshWidget(ctx);
 		},
 	});
@@ -574,8 +598,13 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 		const approver: Approver | undefined = ctx.hasUI
 			? (message) => ctx.ui.confirm("Approve CTF experiment?", message)
 			: undefined;
-		auditor = new CtfAuditor(join(ctx.cwd, configDirName, "ctf-runs"), invocationExecutor, approver);
+		runsRoot = join(ctx.cwd, configDirName, "ctf-runs");
+		auditor = new CtfAuditor(runsRoot, invocationExecutor, approver);
 		await auditor.load();
+		knownRunIds = (await readdir(runsRoot, { withFileTypes: true }))
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name)
+			.sort();
 		applyToolMode();
 		refreshWidget(ctx);
 	});
