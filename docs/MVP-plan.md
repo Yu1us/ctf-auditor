@@ -45,7 +45,7 @@
 4. 需要网络访问真实目标，或风险为 `HIGH` / `IRREVERSIBLE`；
 5. 同类探索连续失败，继续尝试已不再是简单定位问题。
 
-反之，工作区内的读取、枚举、搜索、短时类型检查和局部静态检查默认可作为 trace。写入、编辑仍由路径授权规则约束，不能因为属于 trace 而绕过审批或工作区边界。
+反之，读取、枚举、搜索、短时类型检查和局部静态检查默认可作为 trace。标准工具也可以直接使用；Auditor 不额外限制 `bash` 或 `write` / `edit` 路径。
 
 同一路径上的逐步确认应保留在一个假设下；只有陈述的可证伪主张实质变化或出现新的决策分叉时才新增假设。系统提示应明确鼓励合并探索步骤，避免把“找到入口 → 查类型 → 编译 → 加载”机械拆成多个假设。
 
@@ -158,7 +158,7 @@ trace/实验目录及其 ID 本身就是来源引用，不再单独维护 `Evide
 
 用于连续执行低风险探索命令，只要求 `command`、`purpose` 和 `timeoutSeconds`。每次调用分配 trace ID，并将请求、完整输出和退出码写入 `traces/T0001/`。它不改变假设状态、不累加连续失败次数，也不产生 `OBSERVED`/`DERIVED` 结论。
 
-`ctf_trace` 只接受 `LOW` 风险；扩展检测到网络目标访问、明显高资源/长时操作或不可逆行为时应拒绝，并提示改用 `ctf_experiment`。工作区路径校验与输出截断规则和实验一致。
+`ctf_trace` 只接受 `LOW` 风险；扩展检测到网络目标访问、明显高资源/长时操作或不可逆行为时应拒绝，并提示改用 `ctf_experiment`。trace 与实验使用相同的输出截断规则。
 
 ### `ctf_experiment`
 
@@ -181,12 +181,11 @@ trace/实验目录及其 ID 本身就是来源引用，不再单独维护 `Evide
 风险规则：
 
 - `LOW`：直接执行；读取、搜索、短时局部验证默认属于此类。
-- `HIGH`：若同一假设没有已关闭的真实实验，视为证据不足，必须人工批准；无 UI 时拒绝。
-- `IRREVERSIBLE`：始终需要批准。
-- 授权工作区外的操作始终拒绝，不能靠批准放行。
+- `HIGH`：直接执行并记录。
+- `IRREVERSIBLE`：始终需要批准；无 UI 时拒绝。
 - `HIGH` 包含高耗时、高资源或过深探索；风险不按“命令看起来危险”判断，而按错误方向上的预期时间、CPU、网络、磁盘、影响范围和回退成本判断。
 
-扩展直接从状态判断同一假设是否已有真实实验，不要求模型提交证据引用或说明。使用 Pi/Node 现有进程执行和截断能力，不自行实现 shell parser、进程树管理或日志框架。
+使用 Pi/Node 现有进程执行和截断能力，不自行实现 shell parser、进程树管理或日志框架。
 
 ### `ctf_conclude`
 
@@ -211,26 +210,22 @@ trace/实验目录及其 ID 本身就是来源引用，不再单独维护 `Evide
 ### `/ctf`
 
 ```text
+/ctf toggle
 /ctf status
 /ctf complete
 /ctf abort
-/ctf dev
-/ctf audit
 ```
 
 `complete` 需要有 UI 的人工确认；无 UI 拒绝。状态展示使用一行 `setWidget()`，不写自定义 TUI 组件。
 
-### 开发模式
+### 审计开关
 
-开发 Extension 本身时，使用 `/ctf dev`；它会恢复启动前的标准工具、停止注入 CTF 工作流提示，并暂停所有 CTF 工具调用拦截。该选择作为 session entry 保存，因此 `/reload` 后仍然生效。用 `/ctf audit` 恢复审计模式。
-
-也可通过 `pi --ctf-dev` 直接启动开发模式；此 CLI flag 在当前进程中优先于 session 设置。开发模式只用于改造/调试该 Extension，不应在真实 CTF 审计中启用。
+审计约束默认关闭。`/ctf toggle` 在开启和关闭之间切换：开启时增加 CTF 工具并注入工作流提示，标准工具始终可用；关闭时暂停提示注入。状态保存在项目的 `.pi/ctf-auditor.json`，因此 `/reload`、新建或切换 session 后会继承上次状态。
 
 ## 必要 Hooks
 
-- `session_start`：加载 state；审计模式移除内置 `bash` 并显示 Widget，确保 shell 命令通过 `ctf_trace` 或 `ctf_experiment` 的风险门；开发模式恢复标准工具。
+- `session_start`：加载 state 和项目开关配置；开启时在保留标准工具的同时增加 CTF 工具并显示 Widget。
 - `before_agent_start`：仅审计模式注入当前成功指标、活跃假设、最近结论、下一步和阻塞原因。
-- `tool_call`：仅审计模式阻止授权工作区外的 `write/edit`，并拒绝未知执行型工具。
 - `session_shutdown`：flush 状态并恢复原 active tools。
 
 不接入其余生命周期事件；工具执行记录已由 `ctf_experiment` 完成。

@@ -89,7 +89,14 @@ async function main(): Promise<void> {
 			nextAction: "test the remaining hypothesis",
 		});
 
-		await rejects(() => auditor.experiment(request(h3, { risk: "HIGH" })), /requires approval/);
+		const highWithoutApproval = await auditor.experiment(request(h3, { risk: "HIGH" }));
+		await auditor.conclude({
+			experimentId: highWithoutApproval.experimentId,
+			verdict: "INCONCLUSIVE",
+			grade: "OBSERVED",
+			conclusion: "high-risk probe did not require approval",
+			nextAction: "request approval for the irreversible probe",
+		});
 		await rejects(() => auditor.experiment(request(h3, { risk: "IRREVERSIBLE" })), /requires approval/);
 
 		let approvals = 0;
@@ -98,11 +105,7 @@ async function main(): Promise<void> {
 			return true;
 		});
 		await approved.load();
-		await rejects(
-			() => approved.experiment(request(h3, { command: "scan ../outside", risk: "HIGH" })),
-			/outside the authorized workspace/,
-		);
-		const high = await approved.experiment(request(h3, { risk: "HIGH" }));
+		const high = await approved.experiment(request(h3, { command: "scan ../outside", risk: "IRREVERSIBLE" }));
 		assert.equal(approvals, 1);
 		await approved.conclude({
 			experimentId: high.experimentId,
@@ -115,7 +118,7 @@ async function main(): Promise<void> {
 		const resumed = new CtfAuditor(runsRoot, fakeExecutor);
 		await resumed.load();
 		assert.equal(resumed.state?.run.id, "test-run");
-		assert.equal(resumed.state?.experiments.length, 4);
+		assert.equal(resumed.state?.experiments.length, 5);
 		assert.equal(resumed.state?.traces.length, 1);
 		assert.equal(resumed.state?.traces[0].status, "CLOSED");
 		assert.equal(resumed.state?.experiments.every((item) => item.status === "CLOSED"), true);

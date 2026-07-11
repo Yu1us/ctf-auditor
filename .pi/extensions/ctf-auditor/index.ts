@@ -77,18 +77,16 @@ const CTF_COMMAND_ARGUMENTS: AutocompleteItem[] = [
 	{ value: "status", label: "status", description: "Show the current CTF audit status" },
 	{ value: "complete", label: "complete", description: "Mark the active CTF run as complete" },
 	{ value: "abort", label: "abort", description: "Abort the active CTF run" },
-	{ value: "dev", label: "dev", description: "Disable CTF enforcement while developing this extension" },
-	{ value: "audit", label: "audit", description: "Re-enable the CTF audit workflow and enforcement" },
+	{ value: "toggle", label: "toggle", description: "Toggle CTF audit workflow enforcement" },
 	{ value: "flow", label: "flow", description: "Generate an interactive React Flow page for a run id" },
 ];
 const SAMPLE_KINDS = ["REAL", "SYNTHETIC"] as const;
 const RISKS = ["LOW", "HIGH", "IRREVERSIBLE"] as const;
 const VERDICTS = ["SUPPORTS", "REFUTES", "INCONCLUSIVE"] as const;
 const GRADES = ["OBSERVED", "DERIVED"] as const;
-const SAFE_TOOL_NAMES = new Set(["read", "grep", "find", "ls", "write", "edit", "question", "questionnaire", "ask_user_question"]);
 const AUDITOR_TOOL_NAMES = ["ctf_run", "ctf_trace", "ctf_experiment", "ctf_conclude"];
 const WIDGET_ID = "ctf-auditor";
-const MODE_ENTRY_TYPE = "ctf-auditor-mode";
+const CONFIG_FILE_NAME = "ctf-auditor.json";
 const DEFAULT_MAX_BYTES = 50 * 1024;
 const DEFAULT_MAX_LINES = 2000;
 
@@ -130,26 +128,8 @@ function isWithin(root: string, candidate: string): boolean {
 	return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
 
-async function canonicalize(path: string): Promise<string> {
-	const absolute = resolve(path);
-	try {
-		return await realpath(absolute);
-	} catch {
-		const parent = dirname(absolute);
-		if (parent === absolute) throw new Error(`Path does not exist: ${path}`);
-		return join(await canonicalize(parent), absolute.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)));
-	}
-}
-
 function traceNeedsExperiment(command: string): boolean {
 	return /(?:^|\s)(?:curl|wget|ssh|scp|nc|ncat|telnet|nmap|masscan|sqlmap)\b|https?:\/\/|(?:^|\s)(?:rm\s+-rf|shutdown|reboot|format)\b/i.test(command);
-}
-
-function commandHasObviousEscape(command: string): boolean {
-	if (command.includes("\0")) return true;
-	if (/(^|[\s'"=])\.\.([\\/]|$)/.test(command)) return true;
-	if (/(^|[\s'"=])(?:[A-Za-z]:[\\/]|\\\\|\/(?!\/))/.test(command)) return true;
-	return false;
 }
 
 function makeRunId(): string {
@@ -267,7 +247,6 @@ export class CtfAuditor {
 		required(request.command, "command");
 		required(request.purpose, "purpose");
 		if (!Number.isFinite(request.timeoutSeconds) || request.timeoutSeconds <= 0) throw new Error("timeoutSeconds must be positive");
-		if (commandHasObviousEscape(request.command)) throw new Error("Command contains a path outside the authorized workspace");
 		if (traceNeedsExperiment(request.command)) throw new Error("Command exceeds LOW-risk trace scope; use ctf_experiment");
 
 		const canonicalWorkspace = await realpath(state.run.workspace);
@@ -318,12 +297,8 @@ export class CtfAuditor {
 		required(request.expectedSupports, "expectedSupports");
 		required(request.expectedRefutes, "expectedRefutes");
 		if (!Number.isFinite(request.timeoutSeconds) || request.timeoutSeconds <= 0) throw new Error("timeoutSeconds must be positive");
-		if (commandHasObviousEscape(request.command)) throw new Error("Command contains a path outside the authorized workspace");
 
-		const hasClosedReal = state.experiments.some(
-			(item) => item.hypothesisId === request.hypothesisId && item.sampleKind === "REAL" && item.status === "CLOSED",
-		);
-		const needsApproval = request.risk === "IRREVERSIBLE" || (request.risk === "HIGH" && !hasClosedReal);
+		const needsApproval = request.risk === "IRREVERSIBLE";
 		if (needsApproval) {
 			if (!this.approve) throw new Error(`${request.risk} experiment requires approval, but no UI is available`);
 			const accepted = await this.approve(
@@ -438,15 +413,6 @@ export class CtfAuditor {
 		await this.save();
 	}
 
-	async isAuthorizedPath(path: string): Promise<boolean> {
-		if (!this.state) return false;
-		try {
-			return isWithin(this.state.run.workspace, await canonicalize(resolve(this.state.run.workspace, path)));
-		} catch {
-			return false;
-		}
-	}
-
 	private exclusive<T>(action: () => Promise<T>): Promise<T> {
 		const result = this.operation.then(action, action);
 		this.operation = result.then(
@@ -483,8 +449,8 @@ export class CtfAuditor {
 	}
 }
 
-function widgetLine(state: State | undefined, developmentMode: boolean): string {
-	if (developmentMode) return "CTF auditor: DEVELOPMENT MODE | standard tools enabled | /ctf audit to re-enable enforcement";
+function widgetLine(state: State | undefined, auditEnabled: boolean): string {
+	if (!auditEnabled) return "CTF auditor: OFF | standard tools enabled | /ctf toggle to enable";
 	if (!state) return "CTF: not initialized";
 	const active = state.hypotheses.filter((item) => item.status === "ACTIVE").length;
 	const pending = state.experiments.find((item) => item.status !== "CLOSED")?.id ?? "none";
@@ -502,40 +468,35 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	let auditor: CtfAuditor;
 	let toolsBeforeSession: string[] | undefined;
 	let currentContext: ExtensionContext | undefined;
-	let developmentMode = false;
+	let auditEnabled = false;
+	let configPath = "";
 	let runsRoot = "";
 	let knownRunIds: string[] = [];
 
-	const refreshWidget = (ctx: ExtensionContext): void => ctx.ui.setWidget(WIDGET_ID, [widgetLine(auditor?.state, developmentMode)]);
+	const refreshWidget = (ctx: ExtensionContext): void => ctx.ui.setWidget(WIDGET_ID, [widgetLine(auditor?.state, auditEnabled)]);
 	const applyToolMode = (): void => {
 		const standardTools = (toolsBeforeSession ?? pi.getActiveTools()).filter((name) => !AUDITOR_TOOL_NAMES.includes(name));
-		if (developmentMode) {
+		if (!auditEnabled) {
 			pi.setActiveTools(standardTools);
 			return;
 		}
-		pi.setActiveTools([...new Set(standardTools.filter((name) => name !== "bash").concat(AUDITOR_TOOL_NAMES))]);
+		pi.setActiveTools([...new Set(standardTools.concat(AUDITOR_TOOL_NAMES))]);
 	};
-	const restoreModeFromSession = (ctx: ExtensionContext): boolean | undefined => {
-		for (const rawEntry of [...ctx.sessionManager.getBranch()].reverse()) {
-			const entry = rawEntry as { type?: string; customType?: string; data?: { mode?: unknown } };
-			if (entry.type !== "custom" || entry.customType !== MODE_ENTRY_TYPE) continue;
-			if (entry.data?.mode === "development") return true;
-			if (entry.data?.mode === "audit") return false;
+	const loadAuditEnabled = async (): Promise<boolean> => {
+		try {
+			const config = JSON.parse(await readFile(configPath, "utf8")) as { enabled?: unknown };
+			return config.enabled === true;
+		} catch {
+			return false;
 		}
-		return undefined;
 	};
-	const setDevelopmentMode = (enabled: boolean, ctx: ExtensionContext): void => {
-		developmentMode = enabled;
-		pi.appendEntry(MODE_ENTRY_TYPE, { mode: enabled ? "development" : "audit" });
+	const setAuditEnabled = async (enabled: boolean, ctx: ExtensionContext): Promise<void> => {
+		auditEnabled = enabled;
+		await mkdir(dirname(configPath), { recursive: true });
+		await writeFile(configPath, `${JSON.stringify({ enabled }, null, 2)}\n`, "utf8");
 		applyToolMode();
 		refreshWidget(ctx);
 	};
-
-	pi.registerFlag("ctf-dev", {
-		description: "Start CTF Auditor in development mode without CTF workflow enforcement",
-		type: "boolean",
-		default: false,
-	});
 	const textResult = (text: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text }], details });
 
 	pi.registerTool({
@@ -623,7 +584,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	});
 
 	pi.registerCommand("ctf", {
-		description: "CTF audit controls: /ctf status|complete|abort|dev|audit|flow <run-id>",
+		description: "CTF audit controls: /ctf toggle|status|complete|abort|flow <run-id>",
 		getArgumentCompletions: (prefix) => {
 			const value = prefix.trimStart();
 			const flowMatch = value.match(/^flow\s+(.*)$/);
@@ -648,13 +609,12 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 			} else if (action === "abort") {
 				await auditor.setTerminalStatus("ABORTED");
 				ctx.ui.notify("CTF run aborted", "warning");
-			} else if (action === "dev") {
-				setDevelopmentMode(true, ctx);
-				ctx.ui.notify("CTF development mode enabled: standard tools restored and CTF workflow enforcement paused.", "warning");
-				return;
-			} else if (action === "audit") {
-				setDevelopmentMode(false, ctx);
-				ctx.ui.notify("CTF audit mode enabled: commands must use ctf_trace or ctf_experiment.", "info");
+			} else if (action === "toggle") {
+				await setAuditEnabled(!auditEnabled, ctx);
+				ctx.ui.notify(
+					auditEnabled ? "CTF audit enabled: standard tools remain available." : "CTF audit disabled.",
+					auditEnabled ? "info" : "warning",
+				);
 				return;
 			} else if (action.startsWith("flow")) {
 				const match = action.match(/^flow\s+(\S+)$/);
@@ -667,7 +627,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 				const warningText = generated.warnings.length > 0 ? `\nWarnings (${generated.warnings.length}):\n${generated.warnings.join("\n")}` : "";
 				ctx.ui.notify(`Generated ${generated.nodes} React Flow nodes:\n${generated.outputPath}${warningText}`, generated.warnings.length > 0 ? "warning" : "info");
 				return;
-			} else ctx.ui.notify("Usage: /ctf status|complete|abort|dev|audit|flow <run-id>", "warning");
+			} else ctx.ui.notify("Usage: /ctf toggle|status|complete|abort|flow <run-id>", "warning");
 			refreshWidget(ctx);
 		},
 	});
@@ -675,7 +635,8 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	pi.on("session_start", async (_event, ctx) => {
 		currentContext = ctx;
 		toolsBeforeSession = pi.getActiveTools();
-		developmentMode = Boolean(pi.getFlag("ctf-dev")) || restoreModeFromSession(ctx) === true;
+		configPath = join(ctx.cwd, configDirName, CONFIG_FILE_NAME);
+		auditEnabled = await loadAuditEnabled();
 		const invocationExecutor: Executor = async (command, workspace, timeoutMs, signal) => {
 			const shell = shellInvocation(command);
 			return pi.exec(shell.program, shell.args, { cwd: workspace, timeout: timeoutMs, signal });
@@ -695,30 +656,17 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 	});
 
 	pi.on("before_agent_start", async () => {
-		if (developmentMode) return;
+		if (!auditEnabled) return;
 		const status = await auditor.statusText();
 		return {
 			message: {
 				customType: "ctf-auditor-context",
-				content: `[CTF AUDIT CONTROL]\n${status}\n\nAudit decisions, not individual commands. Use ctf_trace for LOW-risk file discovery, searches, environment checks, shell correction, and short local static checks; traces need no hypothesis or conclusion. Use ctf_experiment when a result changes the solution route, validates a key vulnerability/exploit/flag, accesses a real network target, or has meaningful cost/risk. Keep incremental checks on one hypothesis. Every formal experiment needs supports/refutes criteria and must be concluded before the next formal experiment.`,
+				content: `[CTF AUDIT CONTROL]\n${status}\n\nAudit decisions, not individual commands. Standard tools may be used directly. Use ctf_trace when LOW-risk command output should be retained in the audit record. Use ctf_experiment when a result changes the solution route, validates a key vulnerability/exploit/flag, accesses a real network target, or has meaningful cost/risk. Keep incremental checks on one hypothesis. Every formal experiment needs supports/refutes criteria and must be concluded before the next formal experiment. Review and approve IRREVERSIBLE experiments.`,
 				display: false,
 			},
 		};
 	});
 
-	pi.on("tool_call", async (event) => {
-		if (developmentMode) return;
-		if (event.toolName === "bash") return { block: true, reason: "Use ctf_trace for LOW-risk exploration or ctf_experiment for key validation" };
-		if (event.toolName === "write" || event.toolName === "edit") {
-			const path = (event.input as { path?: unknown }).path;
-			if (typeof path !== "string" || !(await auditor.isAuthorizedPath(path))) {
-				return { block: true, reason: "Write/edit path is outside the authorized CTF workspace" };
-			}
-			return;
-		}
-		if (event.toolName.startsWith("ctf_") || SAFE_TOOL_NAMES.has(event.toolName)) return;
-		return { block: true, reason: `Unknown execution-capable tool blocked by CTF auditor: ${event.toolName}` };
-	});
 
 	pi.on("session_shutdown", async () => {
 		await auditor?.flush();
