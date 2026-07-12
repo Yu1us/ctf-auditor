@@ -655,15 +655,11 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 		refreshWidget(ctx);
 	});
 
-	pi.on("before_agent_start", async () => {
+	pi.on("before_agent_start", async (event) => {
 		if (!auditEnabled) return;
 		const status = await auditor.statusText();
 		return {
-			message: {
-				customType: "ctf-auditor-context",
-				content: `[CTF AUDIT CONTROL]\n${status}\n\nAudit decisions, not individual commands. Standard tools may be used directly. Use ctf_trace when LOW-risk command output should be retained in the audit record. Use ctf_experiment when a result changes the solution route, validates a key vulnerability/exploit/flag, accesses a real network target, or has meaningful cost/risk. Keep incremental checks on one hypothesis. Every formal experiment needs supports/refutes criteria and must be concluded before the next formal experiment. Review and approve IRREVERSIBLE experiments.`,
-				display: false,
-			},
+			systemPrompt: `${event.systemPrompt}\n\n[CTF AUDIT CONTROL]\n${status}\n\nAudit decisions, not individual commands. Standard tools may be used directly. Use ctf_trace when LOW-risk command output should be retained in the audit record. Use ctf_experiment when a result changes the solution route, validates a key vulnerability/exploit/flag, accesses a real network target, or has meaningful cost/risk. Keep incremental checks on one hypothesis. Every formal experiment needs supports/refutes criteria and must be concluded before the next formal experiment. Review and approve IRREVERSIBLE experiments.`,
 		};
 	});
 
