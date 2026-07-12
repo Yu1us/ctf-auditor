@@ -4,3 +4,4 @@
 !.pi/extensions/ctf-auditor/
 
 node_modules/
+.dev/

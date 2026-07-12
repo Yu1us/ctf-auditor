@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "build:viewer": "vite build --config .pi/extensions/ctf-auditor/viewer/vite.config.ts",
-    "test": "tsx .dev/index.test.ts && tsx .dev/run-visualization.test.ts && tsx .dev/flow-graph.test.ts"
+    "test": "tsx .dev/index.test.ts && tsx .dev/windows-command-runner.test.ts && tsx .dev/run-visualization.test.ts && tsx .dev/flow-graph.test.ts"
   },
   "dependencies": {
     "@xyflow/react": "^12.8.5",

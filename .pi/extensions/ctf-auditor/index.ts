@@ -138,7 +138,10 @@ function makeRunId(): string {
 
 function shellInvocation(command: string): { program: string; args: string[] } {
 	if (process.platform === "win32") {
-		return { program: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", command] };
+		// pi.exec decodes output as UTF-8, while cmd.exe writes in the active OEM
+		// code page. Transcode through a tiny Node runner before pi sees the bytes.
+		const runner = join(dirname(fileURLToPath(import.meta.url)), "windows-command-runner.cjs");
+		return { program: process.execPath, args: [runner, command] };
 	}
 	return { program: process.env.SHELL || "/bin/sh", args: ["-c", command] };
 }
@@ -504,7 +507,10 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 		label: "CTF Run",
 		description: "Initialize and manage the CTF audit state machine.",
 		promptSnippet: "Initialize/manage CTF runs and falsifiable hypotheses",
-		promptGuidelines: ["Use ctf_run to initialize the audit and manage at most three falsifiable hypotheses."],
+		promptGuidelines: [
+			"Use ctf_run to initialize the audit and manage at most three falsifiable hypotheses.",
+			"Call the replan action only when the reported run status is REPLAN_REQUIRED; it is invalid for ACTIVE runs.",
+		],
 		parameters: Type.Object({
 			action: StringEnum(RUN_ACTIONS),
 			successCriterion: Type.Optional(Type.String()),
@@ -517,7 +523,13 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 			if (params.action === "init") await auditor.init(params.successCriterion ?? "", params.workspace ?? "");
 			else if (params.action === "add_hypothesis") await auditor.addHypothesis(params.statement ?? "", params.falsificationTest ?? "");
 			else if (params.action === "park_hypothesis") await auditor.parkHypothesis(required(params.hypothesisId, "hypothesisId"));
-			else if (params.action === "replan") await auditor.replan();
+			else if (params.action === "replan") {
+				if (auditor.state?.run.status === "REPLAN_REQUIRED") await auditor.replan();
+				else {
+					refreshWidget(ctx);
+					return textResult(`Replan skipped: current run status is ${auditor.state?.run.status ?? "not initialized"}.\n${await auditor.statusText()}`, { state: auditor.state });
+				}
+			}
 			refreshWidget(ctx);
 			return textResult(await auditor.statusText(), { state: auditor.state });
 		},
@@ -634,6 +646,7 @@ export default async function ctfAuditorExtension(pi: ExtensionAPI): Promise<voi
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentContext = ctx;
+		if (ctx.mode === "tui") ctx.ui.setToolsExpanded(false);
 		toolsBeforeSession = pi.getActiveTools();
 		configPath = join(ctx.cwd, configDirName, CONFIG_FILE_NAME);
 		auditEnabled = await loadAuditEnabled();
