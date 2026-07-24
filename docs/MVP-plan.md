@@ -1,297 +1,384 @@
-# ctf-auditor 最小实现计划
+# ctf-auditor v2 本地实施计划
 
-## 目标
+## 1. 本地结论
 
-为 Pi `0.80.x` 提供一个 CTF 审计 Extension，只约束最关键闭环：
+当前仓库实现的是实验审计器，不适合在原状态机上继续增量修改。v2 直接收缩为“按需生成接管包，再换到新会话”，不迁移 hypothesis / experiment / trace 数据。
 
-```text
-低风险探索（trace，可连续执行） ─┐
-                               ├→ 关键假设 → 实验 → 结论 → 下一步
-已有文件读取/搜索（安全工具） ────┘
-```
+本地运行时为 Pi `0.81.1`，已确认可直接使用：
 
-审计粒度以“会改变解题方向的决策分叉”为单位，而不是以每条命令为单位。默认仅用于合法 CTF、靶场和用户明确授权的环境。
+- `ctx.sessionManager.getBranch()`、`buildContextEntries()`、`buildSessionContext()`、`getLeafId()`；
+- `ctx.ui.editor()`；
+- `ctx.newSession({ parentSession, setup, withSession })`；
+- `pi.setLabel()`；
+- `CONFIG_DIR_NAME`；
+- 当前模型与 `ctx.modelRegistry.getApiKeyAndHeaders()`。
 
-## 必须保证
+项目名、安装名和扩展目录名统一保留为 **ctf-auditor**；“handoff / 接管”只描述 v2 的工作方式，不作为新名称。
 
-1. 初始化时记录最小成功指标和工作区。
-2. 同时最多 3 个活跃假设；每个假设必须可证伪。
-3. 默认先做低成本验证，再扩大实验范围；低风险、短时、易回退且不直接构成关键结论的探索命令通过 `ctf_trace` 连续执行，关键验证通过 `ctf_experiment` 执行。
-4. 正式实验仍保持“上一实验未归纳前禁止下一实验”；该约束不阻止安全的文件工具，也不要求把普通探索人为包装成实验。
-5. 完整 stdout/stderr、命令和退出码落盘；模型只接收截断结果。
-6. 合成测试不能产生 `OBSERVED` 结论；生成代码本身不算证据。
-7. 同一假设连续两次 `REFUTES` 或 `INCONCLUSIVE` 后要求 replan。
-8. “高风险”主要指证据不足时进行高耗时、高资源或过深探索；这类实验必须人工批准。不可逆操作同样需要批准，路径越界始终拒绝。
-9. 人工确认前不能把 run 标记为完成。
+## 2. 最终范围
 
-其余评分、Dashboard、远程后端、通用 Gate、reviewer LLM 和多模式策略暂不实现。
-
-## 自适应粒度
-
-### 基本原则
-
-审计对象是一次有意义的判断，而不是一次工具调用。定位文件、搜索符号、检查环境、纠正 shell 语法等操作通常只是探索步骤，不应各自创建假设并强制归纳。
-
-使用两级执行模型：
-
-- `trace`：低风险探索。自动保存命令、退出码、stdout/stderr，可在同一调查过程中连续执行，不要求逐条填写 supports/refutes 或调用 `ctf_conclude`。
-- `experiment`：关键验证。必须绑定可证伪假设、预先声明支持/证伪判据，并在继续下一个正式实验前归纳。
-
-以下任一条件成立时，应从 trace 升级为 experiment：
-
-1. 结果会决定是否切换解题路线或淘汰一个主要假设；
-2. 操作直接验证关键漏洞、利用链、flag 或最终成功标准；
-3. 预计耗时、资源消耗、目标影响或回退成本明显增加；
-4. 需要网络访问真实目标，或风险为 `HIGH` / `IRREVERSIBLE`；
-5. 同类探索连续失败，继续尝试已不再是简单定位问题。
-
-反之，读取、枚举、搜索、短时类型检查和局部静态检查默认可作为 trace。标准工具也可以直接使用；Auditor 不额外限制 `bash` 或 `write` / `edit` 路径。
-
-同一路径上的逐步确认应保留在一个假设下；只有陈述的可证伪主张实质变化或出现新的决策分叉时才新增假设。系统提示应明确鼓励合并探索步骤，避免把“找到入口 → 查类型 → 编译 → 加载”机械拆成多个假设。
-
-### 收归时机
-
-trace 不逐条收归，但应在以下边界生成简短调查摘要，并把相关 trace ID 作为来源：
-
-- 创建或修改正式假设前；
-- 启动关键实验前；
-- 改变路线、暂停假设或 replan 时；
-- run 完成或中止时。
-
-首期摘要可由模型写入下一次 hypothesis/experiment 的说明或 run 结束记录，不新增 claim/evidence 图谱。原始 trace 始终独立落盘，保证可回放。
-
-## 最小代码结构
+只保留一个 agent 不可调用的 slash command：
 
 ```text
-.pi/extensions/ctf-auditor/
-└── index.ts       # 类型、状态、持久化、3 个工具、/ctf 命令和 Pi hooks
-
-.dev/
-└── index.test.ts  # 仅开发阶段使用的状态机测试
-```
-
-不建 `models/`、`services/`、`repositories/`、backend 接口或 package；先使用 Node/Pi 已有 API。只有 `index.ts` 明显失控后再按职责拆文件。
-
-运行数据：
-
-```text
-.pi/ctf-runs/<run-id>/
-├── state.json
-├── traces/T0001/
-│   ├── request.json
-│   ├── stdout.txt
-│   ├── stderr.txt
-│   └── result.json
-└── experiments/E0001/
-    ├── request.json
-    ├── stdout.txt
-    ├── stderr.txt
-    └── result.json
-```
-
-`state.json` 用临时文件 + rename 原子更新，只保存状态机所需索引。实验请求、执行结果和结论以实验目录为准，无需额外事件日志，也不为 hypothesis、claim、artifact 分别建立 ledger。
-
-## 最小数据模型
-
-```ts
-type Grade = "OBSERVED" | "DERIVED";
-type Verdict = "SUPPORTS" | "REFUTES" | "INCONCLUSIVE";
-
-interface TraceRequest {
-  command: string;
-  purpose: string;
-  timeoutSeconds: number;
-}
-
-interface ExperimentRequest {
-  hypothesisId: string;
-  command: string;
-  expectedSupports: string;
-  expectedRefutes: string;
-  sampleKind: "REAL" | "SYNTHETIC";
-  risk: "LOW" | "HIGH" | "IRREVERSIBLE";
-  timeoutSeconds: number;
-}
-
-interface State {
-  run: {
-    id: string;
-    successCriterion: string;
-    workspace: string;
-    status: "ACTIVE" | "REPLAN_REQUIRED" | "COMPLETE" | "ABORTED";
-  };
-  traces: Array<{
-    id: string;
-    status: "RUNNING" | "CLOSED";
-  }>;
-  hypotheses: Array<{
-    id: string;
-    statement: string;
-    falsificationTest: string;
-    status: "ACTIVE" | "SUPPORTED" | "REFUTED" | "PARKED";
-    consecutiveFailures: number;
-  }>;
-  experiments: Array<{
-    id: string;
-    hypothesisId: string;
-    sampleKind: "REAL" | "SYNTHETIC";
-    status: "RUNNING" | "AWAITING_CONCLUSION" | "CLOSED";
-  }>;
-  seq: number;
-}
-```
-
-trace/实验目录及其 ID 本身就是来源引用，不再单独维护 `Evidence`、`Artifact`、`Gate`、`Resource` 实体。trace 与 experiment 使用独立序号，避免探索数量影响正式实验 ID。需要通用 Gate 或远程预算时再增加。
-
-## Pi 接口
-
-### `ctf_run`
-
-动作：`init | add_hypothesis | park_hypothesis | replan | status`
-
-- `init`：要求成功指标和工作区。
-- `add_hypothesis`：要求 statement 和 falsificationTest。
-- `replan`：清除 `REPLAN_REQUIRED`。
-- `status`：返回当前假设、待归纳实验、最近结论、下一步和成功指标。
-
-### `ctf_trace`
-
-用于连续执行低风险探索命令，只要求 `command`、`purpose` 和 `timeoutSeconds`。每次调用分配 trace ID，并将请求、完整输出和退出码写入 `traces/T0001/`。它不改变假设状态、不累加连续失败次数，也不产生 `OBSERVED`/`DERIVED` 结论。
-
-`ctf_trace` 只接受 `LOW` 风险；扩展检测到网络目标访问、明显高资源/长时操作或不可逆行为时应拒绝，并提示改用 `ctf_experiment`。trace 与实验使用相同的输出截断规则。
-
-### `ctf_experiment`
-
-参数：
-
-```ts
-{
-  hypothesisId: string;
-  command: string;
-  expectedSupports: string;
-  expectedRefutes: string;
-  sampleKind: "REAL" | "SYNTHETIC";
-  risk: "LOW" | "HIGH" | "IRREVERSIBLE";
-  timeoutSeconds: number;
-}
-```
-
-执行顺序：校验状态 → 判定是否审批 → 在授权工作区执行 → 完整输出落盘 → 返回截断摘要 → 状态改为 `AWAITING_CONCLUSION`。
-
-风险规则：
-
-- `LOW`：直接执行；读取、搜索、短时局部验证默认属于此类。
-- `HIGH`：直接执行并记录。
-- `IRREVERSIBLE`：始终需要批准；无 UI 时拒绝。
-- `HIGH` 包含高耗时、高资源或过深探索；风险不按“命令看起来危险”判断，而按错误方向上的预期时间、CPU、网络、磁盘、影响范围和回退成本判断。
-
-使用 Pi/Node 现有进程执行和截断能力，不自行实现 shell parser、进程树管理或日志框架。
-
-### `ctf_conclude`
-
-参数：
-
-```ts
-{
-  experimentId: string;
-  verdict: Verdict;
-  grade: Grade;
-  conclusion: string;
-  nextAction: string;
-}
-```
-
-规则：
-
-- 只能归纳当前待处理实验；
-- `SYNTHETIC` 的结论只能为 `DERIVED`；
-- 将结论写入 `result.json`，关闭实验并更新假设；连续失败 2 次进入 `REPLAN_REQUIRED`。
-
-### `/ctf`
-
-```text
-/ctf toggle
+/ctf checkpoint
+/ctf resume [checkpoint-id]
 /ctf status
 /ctf complete
 /ctf abort
 ```
 
-`complete` 需要有 UI 的人工确认；无 UI 拒绝。状态展示使用一行 `setWidget()`，不写自定义 TUI 组件。
+硬约束：
 
-### 审计开关
+1. 不注册任何 `ctf_*` 工具；
+2. 不监听 `before_agent_start`，不修改 system prompt；
+3. 不代理 shell，不限制原生工具；
+4. 只有用户执行 `/ctf checkpoint` 或 `/ctf resume` 时调用模型；
+5. 未完成人工审阅的 checkpoint 不能 resume；
+6. resume 默认创建新 session，只注入 `resume.md`。
 
-审计约束默认关闭。`/ctf toggle` 在开启和关闭之间切换：开启时增加 CTF 工具并注入工作流提示，标准工具始终可用；关闭时暂停提示注入。状态保存在项目的 `.pi/ctf-auditor.json`，因此 `/reload`、新建或切换 session 后会继承上次状态。
+暂不实现 diagnose、evidence、compare、toggle、flow、自动停滞检测、checkpoint 可视化和旧审计数据迁移。
 
-## 必要 Hooks
+## 3. 本地删除清单
 
-- `session_start`：加载 state 和项目开关配置；开启时在保留标准工具的同时增加 CTF 工具并显示 Widget。
-- `before_agent_start`：仅审计模式注入当前成功指标、活跃假设、最近结论、下一步和阻塞原因。
-- `session_shutdown`：flush 状态并恢复原 active tools。
+### `.pi/extensions/ctf-auditor/index.ts`
 
-不接入其余生命周期事件；工具执行记录已由 `ctf_experiment` 完成。
+删除：
 
-## 实现顺序
+- `Grade`、`Verdict`、`SampleKind`、`Risk`；
+- `TraceRequest`、`ExperimentRequest`、`ConclusionInput`、旧 `State`；
+- `CtfAuditor` 的 hypothesis / trace / experiment / conclude 执行状态机；
+- shell runner、风险判断、输出截断和审批逻辑；
+- 四个 `registerTool()`；
+- toggle 配置、动态工具集合管理；
+- `before_agent_start`；
+- `/ctf flow` 和 `generateRunFlow` import。
 
-### 0. API spike
+保留或改写：
 
-用最小临时代码验证：
+- `required()`、路径规范化/边界检查；
+- 临时文件 + rename 的原子 JSON 写入；
+- `/ctf` 参数补全；
+- pending checkpoint 的单行 widget；
+- `session_start` / `session_shutdown` 的轻量状态刷新。
 
-- `setActiveTools()` 可移除/恢复 Bash；
-- 自定义工具支持取消、timeout 和截断；
-- 高成本/深探索且证据不足时触发审批，无 UI 可 fail-closed；
-- Windows/Linux 下 cwd、路径 canonicalization 和进程终止有效。
+### 删除旧可视化与命令代理
 
-验证结果直接写入本文件勾选，不单建 API 报告系统。
+```text
+.pi/extensions/ctf-auditor/run-visualization.ts
+.pi/extensions/ctf-auditor/viewer/
+.pi/extensions/ctf-auditor/windows-command-runner.cjs
+docs/react-flow-visualization-plan.md
+.dev/run-visualization.test.ts
+.dev/flow-graph.test.ts
+.dev/windows-command-runner.test.ts
+.dev/chrome-error.txt
+.dev/http.log
+.dev/run-dom.txt
+```
 
-### 1. 单文件 MVP
+### `package.json`
 
-1. 状态模型和原子保存；
-2. `ctf_run`；
-3. Bash 移除/恢复与 balanced 风险判定；
-4. `ctf_experiment` 与原始输出落盘；
-5. `ctf_conclude` 与两次失败 replan；
-6. `/ctf status|complete|abort` 和单行 Widget。
+删除 `build:viewer`、React Flow / React / Vite 及对应类型依赖。保留 `tsx`、TypeScript、Node 类型和一个 `test` 脚本；重新生成 `package-lock.json`。
 
-### 2. 自适应粒度
+旧 `.pi/ctf-runs/` 和 `.pi/ctf-auditor.json` 属于用户数据，v2 只忽略，不自动删除或转换。
 
-1. 增加 `ctf_trace` 及 `traces/` 原始记录；
-2. 在注入提示中明确 trace/experiment 的选择标准和升级边界；
-3. 保留正式实验的单待归纳约束，trace 不创建待归纳状态；
-4. 状态和回放中区分探索记录与正式实验，避免 trace 被展示成支持/证伪结论；
-5. 用一次日常短任务和一次本地 CTF golden run 比较工具调用数、正式假设数及关键证据完整性。
+## 4. 文件与状态
 
-### 3. 仅补真实缺口
+```text
+.pi/ctf-auditor/
+├── state.json
+└── CP-20260722-001/
+    ├── machine.md
+    ├── human.md
+    ├── resume.md          # 仅 REVIEWED 后生成
+    ├── manifest.json
+    └── raw/               # 仅物化被引用且没有现成文件的工具结果
+```
 
-完成上述回放后，只修复实际暴露的问题。不要预先加入 strict/observe 等额外模式、HTML 报告、Docker/SSH、评分器或可插拔 backend。
+```ts
+type CheckpointStatus =
+  | "AWAITING_HUMAN"
+  | "REVIEWED"
+  | "RESUMED"
+  | "ABORTED";
 
-## 最小测试
+type AuditorStatus = "ACTIVE" | "COMPLETE" | "ABORTED";
 
-`.dev/index.test.ts` 仅用于开发阶段，使用 Node `assert` 覆盖一条完整流程和关键拒绝：
+interface Checkpoint {
+  id: string;
+  createdAt: string;
+  sourceSessionPath?: string;
+  sourceLeafId?: string;
+  workspace: string;
+  machinePath: string;
+  humanPath: string;
+  resumePath?: string;
+  status: CheckpointStatus;
+  previousCheckpointId?: string;
+  resumedSessionPath?: string;
+  resumedAt?: string;
+}
 
-1. 未初始化不能实验；
-2. 第 4 个活跃假设被拒绝；
-3. 未归纳时第二个正式实验被拒绝，但低风险 trace 不被误报为第二个实验；
-4. trace 无法产生结论或更新假设状态，且高风险 trace 被要求升级为 experiment；
-5. synthetic `OBSERVED` 被拒绝；
-6. 连续两次正式实验失败进入 `REPLAN_REQUIRED`，trace 失败不计入；
-7. 低成本局部 trace 无需审批且完整输出落盘；
-8. 无证据的高成本/深探索、不可逆操作在无 UI 时被拒绝；
-9. 即使获批，工作区路径逃逸仍被拒绝；
-10. resume 后 state 和 trace 索引可恢复。
+interface AuditorState {
+  version: 2;
+  status: AuditorStatus;
+  checkpoints: Checkpoint[];
+  latestCheckpointId?: string;
+}
+```
 
-另做一次人工集成检查：模型无法绕过 `ctf_experiment` 直接调用 Bash，实验原始输出可从磁盘回放。
+`AuditorState.status` 是本地补充，只为保留 `/ctf complete` 与 `/ctf abort` 的语义，不参与 agent 推理：
 
-## MVP 验收
+- `complete`：人工确认后记录本工作区任务已完成；
+- `abort`：中止最新未 resume 的 checkpoint，并记录任务已中止；
+- 后续显式执行 `checkpoint` 会重新置为 `ACTIVE`，不再增加 reset/init 命令。
 
-- [ ] 成功指标和工作区必填；
-- [ ] 无内置 Bash，shell 命令经 trace/experiment 的 balanced 风险门；
-- [ ] 普通探索无需伪造假设或逐条归纳，关键实验必须绑定假设及 supports/refutes 判据；
-- [ ] 每次只允许一个待归纳的正式实验，trace 不占用该槽位；
-- [ ] trace 与 experiment 的原始输出和执行元数据均可追溯；
-- [ ] 日常短任务不会把文件定位、环境检查和 shell 纠错机械拆成多个正式实验；
-- [ ] synthetic 不会提升为虚假观察；
-- [ ] 两次失败强制 replan；
-- [ ] 低成本 probe 不打断用户，无证据的高成本/深探索需要审批；
-- [ ] 不可逆操作需审批，路径越界始终 fail-closed；
-- [ ] 人工确认后才能完成 run；
-- [ ] resume 后状态不丢失。
+`state.json` 是插件索引，`manifest.json` 是 checkpoint 包内的可移植元数据。两者都原子写入；加载时以 `state.json` 为准，并检查 manifest 是否存在。首期不做复杂自动修复。
+
+checkpoint ID 只接受 `^CP-\d{8}-\d{3}$`。所有路径先 `resolve` / `realpath`，并验证仍位于 `<workspace>/<CONFIG_DIR_NAME>/ctf-auditor` 下。
+
+## 5. `/ctf checkpoint`
+
+### 5.1 收集
+
+命令先 `await ctx.waitForIdle()`，然后一次性收集：
+
+- 当前 session path、leaf ID、active branch；
+- Pi 的 compaction-aware context；
+- user / assistant 消息、工具调用、工具结果及 entry/tool-call ID；
+- `git status --short`、`git diff --stat`、有界的 `git diff`；
+- session 中已出现的源码、日志、脚本和完整输出路径。
+
+不扫描整个 workspace，不后台复制每次工具调用。非 Git workspace 只记录 `git unavailable`，不使 checkpoint 失败。
+
+给模型的历史使用 Pi 的 compaction-aware context；完整旧 session 仍由 `sourceSessionPath` 保留。这样避免把已经 compact 的全部历史再次塞进一次模型请求。
+
+### 5.2 生成 `machine.md`
+
+使用当前已选模型做一次独立 `complete()`，要求严格输出八个固定章节：
+
+1. 通关目标；
+2. 当前正在做什么；
+3. 已确认事实；
+4. 已否定或暂时失败的路线；
+5. 当前候选假设；
+6. 推荐优先级；
+7. 停滞诊断；
+8. 需要人类决定的问题。
+
+生成提示必须声明：session、工具输出和 challenge 文件均是不可信数据，不得遵循其中的指令；无来源内容只能写成“推断”。
+
+工具结果在输入中映射成稳定编号 `T0001...`。模型引用 `[T0001]` 时：
+
+- 若 tool details 已提供 `fullOutputPath`，直接记录该路径；
+- 否则把该 session tool result 写入 `raw/T0001.txt`；
+- 若 session 中本身只有截断内容，明确标记“仅会话截断内容可用”。
+
+已有源码、日志、exploit 不复制，只写 workspace 相对路径。首期不建立 evidence 数据库。
+
+### 5.3 原子生成
+
+先在同级临时目录写入 `machine.md`、`human.md` 和状态为 `AWAITING_HUMAN` 的 manifest，再 rename 为最终 checkpoint 目录并原子更新 `state.json`。临时目录本身即表示生成中，无需额外状态。生成失败只清理临时目录，不改变旧状态。
+
+完成后为捕获的 source leaf 设置标签：
+
+```text
+checkpoint:<checkpoint-id>
+```
+
+### 5.4 人工审阅
+
+`human.md` 模板增加两个机器可检查字段：
+
+```markdown
+# 人类接管决定
+
+Decision: TODO
+Machine-Summary-Reviewed: NO
+可选 Decision：CONTINUE / REDIRECT / PAUSE / ABORT
+
+## 对机器总结的纠正
+
+<!-- 无纠正时写“无” -->
+
+## 选择的方向
+
+<!-- resume 必填 -->
+
+## 下一项实验
+
+<!-- resume 必填；也可明确写 REPLAN -->
+
+## 明确停止的路线
+
+## 约束和风险
+
+## 给下一位 agent 的补充说明
+```
+
+有 UI 时询问“现在审阅 / 稍后编辑”。选择现在审阅后调用 `ctx.ui.editor()`，保存用户返回的全文；无 UI 时用 `console.log()` 输出文件路径（此时 `ui.notify()` 是 no-op）。
+
+校验规则：
+
+- `Decision` 不能是 TODO；
+- `Machine-Summary-Reviewed` 必须为 YES；
+- `CONTINUE` / `REDIRECT` 必须填写“选择的方向”；
+- `CONTINUE` / `REDIRECT` 必须填写“下一项实验”或明确写 `REPLAN`；
+- `PAUSE` / `ABORT` 可以成为 `REVIEWED`，但不能 resume。
+
+编辑器取消或校验失败时保留文件并维持 `AWAITING_HUMAN`。外部编辑后，`/ctf resume` 会重新校验并可将状态推进到 `REVIEWED`。显式的 `Machine-Summary-Reviewed: YES` 代替无法可靠自动判断的“是否处理了所有机器纠正”。
+
+## 6. `/ctf resume [checkpoint-id]`
+
+未传 ID 时选择最新的 `AWAITING_HUMAN` 或 `REVIEWED` checkpoint；参数补全只列可 resume 的 ID。
+
+执行顺序：
+
+1. 校验 checkpoint ID、workspace 边界、`machine.md`、`human.md`、manifest；
+2. 重新校验人工字段；`PAUSE` / `ABORT` 明确拒绝 resume；
+3. 用当前模型把 machine + human 编译成固定七节 `resume.md`；
+4. 人类内容优先于机器总结，纠正后的事实不得从 machine 恢复；
+5. 提示模型输出 1,000～1,500 tokens，并直接设置 `maxTokens: 1500`；
+6. 原子写入 `resume.md`，状态推进为 `REVIEWED`；
+7. 创建新 session。
+
+新 session 使用 Pi `0.81.1` 的正式接口：
+
+```ts
+const parentSession = checkpoint.sourceSessionPath;
+const resumeText = await readFile(checkpoint.resumePath, "utf8");
+
+await ctx.newSession({
+  parentSession,
+  setup: async (sessionManager) => {
+    sessionManager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: resumeText }],
+      timestamp: Date.now(),
+    });
+  },
+  withSession: async (replacementCtx) => {
+    // 这里只使用 replacementCtx；旧 ctx 已失效。
+    await replacementCtx.sendUserMessage(
+      "根据已审阅的接管信息继续。先确认目标、当前假设和第一项实验，然后执行。",
+    );
+  },
+});
+```
+
+`withSession` 中只捕获字符串、ID 和路径。成功切换后，从 `replacementCtx.sessionManager.getSessionFile()` 取得新路径，原子更新 manifest/state，并通过 `replacementCtx.ui` 清除旧 pending widget：
+
+```text
+status = RESUMED
+resumedSessionPath = ...
+resumedAt = ...
+```
+
+若 session switch 被其他扩展取消，checkpoint 保持 `REVIEWED`，可重试。旧 session 不修改，作为原始历史保留。
+
+## 7. `/ctf status|complete|abort`
+
+- `status`：显示任务状态、最新 checkpoint、人工审阅状态、来源 session 和可执行下一步；
+- `complete`：需要 UI 人工确认，写 `AuditorState.status = COMPLETE`；
+- `abort`：把最新 `AWAITING_HUMAN` / `REVIEWED` checkpoint 标记为 `ABORTED`，并写任务状态 `ABORTED`；
+- widget 只在存在待人工审阅或待 resume 的 checkpoint 时显示，其他时间清空。
+
+这些 UI 状态不进入 LLM context。
+
+## 8. 单文件实现边界
+
+首期仍只保留：
+
+```text
+.pi/extensions/ctf-auditor/index.ts
+.dev/index.test.ts
+```
+
+`index.ts` 内只需要：
+
+- 状态与 manifest 类型；
+- `AuditorStore`（load/save/create/update）；
+- branch/workspace 收集与 tool-result 来源映射；
+- machine/human/resume 文本生成和校验；
+- `/ctf` command 与两个 session 生命周期 hook。
+
+不建立 repository/service/provider/interface 层。只有 `index.ts` 在 v2 完成后仍明显难以维护，才拆一个纯文本处理文件。
+
+## 9. 实施顺序
+
+### Phase 1：删除常驻成本
+
+- 删除四个工具、toggle、prompt hook、shell 代理和 React Flow；
+- 缩减依赖、脚本、README 和命令补全；
+- 建立最小 v2 state/store 与 `status|complete|abort`；
+- 验证插件加载前后 active tools 和 system prompt 不变。
+
+### Phase 2a：先验证换 session
+
+在测试临时目录手工构造一个已审阅 checkpoint，先实现并人工验证：
+
+- human 校验；
+- `resume.md` 编译；
+- `newSession` parent tracking；
+- setup 初始消息和 kickoff；
+- cancelled switch 不误标 RESUMED。
+
+不为 spike 增加临时生产命令。
+
+### Phase 2b：实现 checkpoint 包
+
+- session/workspace 按需收集；
+- machine 生成；
+- cited tool result 物化；
+- human editor；
+- leaf label；
+- staging directory + atomic rename。
+
+### Phase 3：质量与失败恢复
+
+只补必要检查：
+
+- machine 八节结构和事实来源；
+- human 覆盖优先级；
+- resume token 上限；
+- 缺失证据提示；
+- 非 Git、无 UI、无模型/密钥、ephemeral session；
+- checkpoint 生成失败不破坏旧状态。
+
+自动停滞提示不进入本轮实现；实战证明需要后再单独评估。
+
+## 10. 最小测试
+
+重写 `.dev/index.test.ts`，使用 Node `assert` 和临时目录覆盖一条流程：
+
+1. checkpoint ID 与路径逃逸校验；
+2. state/manifest 原子保存与 reload；
+3. placeholder human 被拒绝；
+4. 缺少 review acknowledgment、方向或下一实验被拒绝；
+5. 有效 CONTINUE / REDIRECT 进入 REVIEWED；
+6. PAUSE / ABORT 不能 resume；
+7. human correction 在编译输入中优先；
+8. cited session tool result 才物化到 `raw/`；
+9. resume 固定章节校验；
+10. cancelled new session 不标 RESUMED，成功后记录 parent/new session path；
+11. complete/abort 状态可 reload。
+
+另做一次 Pi TUI 人工验收：
+
+```text
+普通 agent 回合：无 ctf_* 工具、无 CTF prompt
+/ctf checkpoint：生成包并可编辑 human.md
+/ctf resume：切到带 parentSession 的新会话并自动 kickoff
+```
+
+## 11. 验收
+
+- [ ] 空闲时不增加工具 schema 或 system prompt；
+- [ ] checkpoint 同时回答“发生了什么”和“为什么卡住”；
+- [ ] 事实有来源，无来源内容标记为推断；
+- [ ] 未人工确认不能 resume；
+- [ ] 人类纠正覆盖机器总结；
+- [ ] 新 session 只接收 `resume.md` 与 kickoff；
+- [ ] 原 session 和已有证据文件不被复制或修改；
+- [ ] 生成失败、编辑取消、session switch 取消都可安全重试；
+- [ ] React Flow、审计工具、shell 代理及其依赖全部移除。
