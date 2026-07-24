@@ -6,10 +6,12 @@ import {
 	AuditorStore,
 	MACHINE_SECTIONS,
 	RESUME_SECTIONS,
+	stagnationSignals,
 	validateHumanReview,
 	validateMachine,
 	validateResume,
 	type ToolSource,
+	type WatchSample,
 } from "../.pi/extensions/ctf-auditor/index.ts";
 
 const machine = MACHINE_SECTIONS.map((heading, index) => {
@@ -56,6 +58,18 @@ async function main(): Promise<void> {
 		validateMachine(machine);
 		assert.throws(() => validateMachine(machine.replace("来源：[T0001]", "")), /must include a source/);
 
+		const stalledSamples: WatchSample[] = Array.from({ length: 3 }, (_, index) => ({
+			turn: index + 1,
+			hypothesis: "mkdir path may reach the target chunk",
+			trace: "The required 1032-byte distance exceeds the 257-byte path limit, but try the same probe again.",
+			actions: ["bash:python find_distance.py"],
+			results: ["bash:target remains unreachable"],
+			errors: 0,
+			contradiction: true,
+		}));
+		assert.ok(stagnationSignals(stalledSamples).length >= 2);
+		assert.ok(stagnationSignals(stalledSamples.slice(0, 2)).length < 2);
+
 		const untouched = validateHumanReview(validHuman.replace("REDIRECT", "TODO"));
 		assert.equal(untouched.canResume, false);
 		assert.match(untouched.errors.join("\n"), /Decision/);
@@ -66,6 +80,8 @@ async function main(): Promise<void> {
 
 		const store = new AuditorStore(root, workspace);
 		await store.load();
+		assert.equal(store.state.watch?.enabled, false);
+		await store.setWatchEnabled(true);
 		const id = await store.nextCheckpointId(new Date("2026-07-22T00:00:00Z"));
 		assert.equal(id, "CP-20260722-001");
 		const sources = new Map<string, ToolSource>([
@@ -108,7 +124,10 @@ async function main(): Promise<void> {
 		await reloaded.load();
 		assert.equal(reloaded.getCheckpoint(id).status, "RESUMED");
 		assert.equal(reloaded.getCheckpoint(id).resumedSessionPath, "new-session.jsonl");
-		await reloaded.setStatus("COMPLETE");
+		assert.equal(reloaded.state.watch?.enabled, true);
+		await reloaded.complete();
+		assert.equal(reloaded.state.status, "COMPLETE");
+		assert.equal(reloaded.state.watch?.enabled, false);
 		await reloaded.abortLatest();
 		assert.equal(reloaded.state.status, "ABORTED");
 

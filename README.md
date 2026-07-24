@@ -1,6 +1,6 @@
 # ctf-auditor
 
-面向 Pi 的 CTF 接管扩展。项目名、安装名和扩展目录名始终是 **ctf-auditor**；“handoff / 接管”只是 v2 的功能定位，不是改名。
+面向 Pi 的 CTF 停滞监督与接管扩展。项目名、安装名和扩展目录名始终是 **ctf-auditor**。
 
 ## 开始任务
 
@@ -12,13 +12,18 @@ pi-link ctf-auditor
 pi
 ```
 
-然后直接向 Pi 描述题目并开始解题。v2 没有 `/ctf init`、`/ctf toggle` 或单独的“开启任务”命令；如果 Pi 已经启动，安装后执行 `/reload`。
+如果 Pi 已经启动，安装后执行 `/reload`。需要自动监督时开启 workspace 级 watch：
 
-需要人工接管时才使用：
+```text
+/ctf watch on
+```
+
+设置会跨 session 保留。正常流程：
 
 ```text
 正常使用 Pi 原生工具解题
-  → /ctf checkpoint
+  → watch 发现重复动作、结果不变或未解决的矛盾
+  → 独立模型复核后中止当前 agent，并自动生成 checkpoint
   → 阅读 machine.md、编辑 human.md
   → /ctf resume
   → 新 session 从人工确认的 resume.md 继续
@@ -29,9 +34,9 @@ pi
 - 注册 agent 可调用的 `ctf_*` 工具；
 - 修改 system prompt；
 - 代理或限制原生 shell / 文件工具；
-- 后台记录每次工具调用。
+- 持久化每次工具调用；watch 只在内存中保留最近 6 个 turn。
 
-只有 `/ctf checkpoint` 和 `/ctf resume` 会调用当前模型。
+`/ctf checkpoint`、`/ctf resume` 会调用当前模型；watch 仅在本地规则同时命中至少两个停滞信号时增加一次模型复核，确认后再生成 checkpoint。
 
 ## 安装
 
@@ -55,9 +60,14 @@ pi-link ctf-auditor
 | --- | --- |
 | `/ctf checkpoint` | 从当前 session branch 和 workspace 生成接管包。 |
 | `/ctf resume [checkpoint-id]` | 校验人工审阅，编译 `resume.md`，创建带父会话关系的新 session。 |
+| `/ctf watch [on\|off\|status]` | 持久化设置 workspace 自动停滞监督。 |
 | `/ctf status` | 显示最新 checkpoint 和下一步。 |
 | `/ctf complete` | 人工确认后标记当前 workspace 任务完成。 |
-| `/ctf abort` | 中止最新待处理 checkpoint。 |
+| `/ctf abort` | 中止最新待处理 checkpoint，并关闭 watch。 |
+
+## Watch
+
+编辑器附近固定显示当前假设和停滞信号。watch 使用最近 6 个 turn 的重复动作、相同结果、未变化假设、工具失败及矛盾表述作为低成本筛选；规则命中后由当前模型独立复核。只有复核确认空转才会调用 `ctx.abort()` 并自动生成接管包。待处理 checkpoint 存在时暂停监督，`/ctf resume` 后在新 session 自动恢复。
 
 ## Checkpoint
 
@@ -120,4 +130,4 @@ Machine-Summary-Reviewed: YES
 npm test
 ```
 
-详细实现计划见 [`docs/MVP-plan.md`](docs/MVP-plan.md)。
+初始 v2 接管实现计划见 [`docs/MVP-plan.md`](docs/MVP-plan.md)；watch 为后续实战增量。

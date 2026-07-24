@@ -1,5 +1,7 @@
 # ctf-auditor v2 本地实施计划
 
+> 本文记录初始按需接管 MVP。后续实战已增加 workspace 级 `/ctf watch`；当前行为以 README 为准。
+
 ## 1. 本地结论
 
 当前仓库实现的是实验审计器，不适合在原状态机上继续增量修改。v2 直接收缩为“按需生成接管包，再换到新会话”，不迁移 hypothesis / experiment / trace 数据。
