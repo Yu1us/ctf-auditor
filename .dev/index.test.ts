@@ -1,137 +1,118 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { CtfAuditor, type ExperimentRequest } from "../.pi/extensions/ctf-auditor/index.ts";
+import { join } from "node:path";
+import {
+	AuditorStore,
+	MACHINE_SECTIONS,
+	RESUME_SECTIONS,
+	validateHumanReview,
+	validateMachine,
+	validateResume,
+	type ToolSource,
+} from "../.pi/extensions/ctf-auditor/index.ts";
 
-const fakeExecutor = async (command: string) => ({
-	stdout: `output:${command}\n`,
-	stderr: "",
-	code: 0,
-	killed: false,
-});
+const machine = MACHINE_SECTIONS.map((heading, index) => {
+	if (index === 2) return `# ${heading}\n\nF1. parser rejected the sample\n来源：[T0001]`;
+	return `# ${heading}\n\n${index === 6 ? "重复动作：无" : "待确认"}`;
+}).join("\n\n") + "\n";
 
-const request = (hypothesisId: string, overrides: Partial<ExperimentRequest> = {}): ExperimentRequest => ({
-	hypothesisId,
-	command: "local-probe",
-	expectedSupports: "probe emits expected marker",
-	expectedRefutes: "probe does not emit expected marker",
-	sampleKind: "REAL",
-	risk: "LOW",
-	timeoutSeconds: 5,
-	...overrides,
-});
+const validHuman = `# 人类接管决定
 
-async function rejects(action: () => Promise<unknown>, pattern: RegExp): Promise<void> {
-	await assert.rejects(action, pattern);
-}
+Decision: REDIRECT
+Machine-Summary-Reviewed: YES
+
+## 对机器总结的纠正
+
+F1 只说明当前实现失败。
+
+## 选择的方向
+
+优先检查长度字段。
+
+## 下一项实验
+
+发送最小 malformed packet。
+
+## 明确停止的路线
+
+停止修改 ROP chain。
+
+## 约束和风险
+
+不重置实例。
+
+## 给下一位 agent 的补充说明
+
+先复现失败阶段。
+`;
+
+const resume = RESUME_SECTIONS.map((heading) => `# ${heading}\n\n${heading} content`).join("\n\n") + "\n";
 
 async function main(): Promise<void> {
 	const workspace = await mkdtemp(join(tmpdir(), "ctf-auditor-test-"));
-	const runsRoot = join(workspace, ".pi", "ctf-runs");
+	const root = join(workspace, ".pi", "ctf-auditor");
 	try {
-		const auditor = new CtfAuditor(runsRoot, fakeExecutor);
+		validateMachine(machine);
+		assert.throws(() => validateMachine(machine.replace("来源：[T0001]", "")), /must include a source/);
 
-		await rejects(() => auditor.experiment(request("H0001")), /not initialized/);
-		await auditor.init("recover the challenge flag", workspace, "test-run");
-		const h1 = await auditor.addHypothesis("input is decoded once", "a double-encoded sample must fail");
-		const h2 = await auditor.addHypothesis("parser accepts a short header", "a minimal real header is rejected");
-		const h3 = await auditor.addHypothesis("deep search is required", "a shallow probe finds the target");
-		await rejects(() => auditor.addHypothesis("fourth", "must fail"), /At most 3/);
+		const untouched = validateHumanReview(validHuman.replace("REDIRECT", "TODO"));
+		assert.equal(untouched.canResume, false);
+		assert.match(untouched.errors.join("\n"), /Decision/);
+		assert.match(validateHumanReview(validHuman.replace("Reviewed: YES", "Reviewed: NO")).errors.join("\n"), /must be YES/);
+		assert.match(validateHumanReview(validHuman.replace("优先检查长度字段。", "")).errors.join("\n"), /选择的方向/);
+		assert.equal(validateHumanReview(validHuman).canResume, true);
+		assert.equal(validateHumanReview(validHuman.replace("REDIRECT", "PAUSE")).canResume, false);
 
-		const first = await auditor.experiment(request(h1, { sampleKind: "SYNTHETIC" }));
-		await rejects(() => auditor.experiment(request(h1)), /Conclude the previous/);
-		const trace = await auditor.trace({ command: "list-files", purpose: "locate challenge files", timeoutSeconds: 5 });
-		assert.equal(trace.traceId, "T0001");
-		assert.match(trace.summary, /output:list-files/);
-		assert.equal(auditor.state?.hypotheses.find((item) => item.id === h1)?.consecutiveFailures, 0);
-		await rejects(
-			() => auditor.trace({ command: "curl https://target.invalid", purpose: "probe target", timeoutSeconds: 5 }),
-			/use ctf_experiment/,
-		);
-		await rejects(
-			() => auditor.conclude({
-				experimentId: first.experimentId,
-				verdict: "INCONCLUSIVE",
-				grade: "OBSERVED",
-				conclusion: "generated fixture only",
-				nextAction: "probe a real sample",
-			}),
-			/Synthetic experiments cannot produce OBSERVED/,
-		);
-		await auditor.conclude({
-			experimentId: first.experimentId,
-			verdict: "INCONCLUSIVE",
-			grade: "DERIVED",
-			conclusion: "generated fixture only",
-			nextAction: "probe a real sample",
+		const store = new AuditorStore(root, workspace);
+		await store.load();
+		const id = await store.nextCheckpointId(new Date("2026-07-22T00:00:00Z"));
+		assert.equal(id, "CP-20260722-001");
+		const sources = new Map<string, ToolSource>([
+			["T0001", {
+				toolCallId: "bash-1",
+				toolName: "bash",
+				entryId: "entry-1",
+				text: "parser rejected the sample\n",
+				truncated: false,
+			}],
+			["T0002", {
+				toolCallId: "bash-2",
+				toolName: "bash",
+				entryId: "entry-2",
+				text: "uncited output\n",
+				truncated: false,
+			}],
+		]);
+		const checkpoint = await store.createCheckpoint({
+			id,
+			machine,
+			sources,
+			sourceSessionPath: "old-session.jsonl",
+			sourceLeafId: "leaf-1",
 		});
+		assert.equal(checkpoint.status, "AWAITING_HUMAN");
+		assert.match(await readFile(checkpoint.machinePath, "utf8"), /raw\/T0001\.txt/);
+		await assert.rejects(() => readFile(join(root, id, "raw", "T0002.txt"), "utf8"), /ENOENT/);
+		assert.equal(JSON.parse(await readFile(join(root, id, "manifest.json"), "utf8")).status, "AWAITING_HUMAN");
+		assert.throws(() => store.getCheckpoint("../outside"), /Invalid checkpoint id/);
 
-		const second = await auditor.experiment(request(h1));
-		await auditor.conclude({
-			experimentId: second.experimentId,
-			verdict: "INCONCLUSIVE",
-			grade: "OBSERVED",
-			conclusion: "real output does not distinguish the cases",
-			nextAction: "replan the hypothesis",
-		});
-		assert.equal(auditor.state?.run.status, "REPLAN_REQUIRED");
-		await rejects(() => auditor.experiment(request(h2)), /REPLAN_REQUIRED/);
-		await auditor.replan();
+		const review = await store.reviewHuman(id, validHuman);
+		assert.equal(review.canResume, true);
+		assert.equal(store.getCheckpoint(id).status, "REVIEWED");
 
-		const low = await auditor.experiment(request(h2));
-		assert.match(low.summary, /output:local-probe/);
-		await auditor.conclude({
-			experimentId: low.experimentId,
-			verdict: "SUPPORTS",
-			grade: "OBSERVED",
-			conclusion: "the local real probe matched",
-			nextAction: "test the remaining hypothesis",
-		});
+		validateResume(resume);
+		await store.writeResume(id, resume);
+		await store.markResumed(id, "new-session.jsonl");
+		const reloaded = new AuditorStore(root, workspace);
+		await reloaded.load();
+		assert.equal(reloaded.getCheckpoint(id).status, "RESUMED");
+		assert.equal(reloaded.getCheckpoint(id).resumedSessionPath, "new-session.jsonl");
+		await reloaded.setStatus("COMPLETE");
+		await reloaded.abortLatest();
+		assert.equal(reloaded.state.status, "ABORTED");
 
-		const highWithoutApproval = await auditor.experiment(request(h3, { risk: "HIGH" }));
-		await auditor.conclude({
-			experimentId: highWithoutApproval.experimentId,
-			verdict: "INCONCLUSIVE",
-			grade: "OBSERVED",
-			conclusion: "high-risk probe did not require approval",
-			nextAction: "request approval for the irreversible probe",
-		});
-		await rejects(() => auditor.experiment(request(h3, { risk: "IRREVERSIBLE" })), /requires approval/);
-
-		let approvals = 0;
-		const approved = new CtfAuditor(runsRoot, fakeExecutor, async () => {
-			approvals += 1;
-			return true;
-		});
-		await approved.load();
-		const high = await approved.experiment(request(h3, { command: "scan ../outside", risk: "IRREVERSIBLE" }));
-		assert.equal(approvals, 1);
-		await approved.conclude({
-			experimentId: high.experimentId,
-			verdict: "SUPPORTS",
-			grade: "OBSERVED",
-			conclusion: "approved real search found the marker",
-			nextAction: "request human completion confirmation",
-		});
-
-		const resumed = new CtfAuditor(runsRoot, fakeExecutor);
-		await resumed.load();
-		assert.equal(resumed.state?.run.id, "test-run");
-		assert.equal(resumed.state?.experiments.length, 5);
-		assert.equal(resumed.state?.traces.length, 1);
-		assert.equal(resumed.state?.traces[0].status, "CLOSED");
-		assert.equal(resumed.state?.experiments.every((item) => item.status === "CLOSED"), true);
-		assert.match(await resumed.statusText(), /request human completion confirmation/);
-
-		const traceStdout = await readFile(join(runsRoot, "test-run", "traces", trace.traceId, "stdout.txt"), "utf8");
-		assert.equal(traceStdout, "output:list-files\n");
-		const stdout = await readFile(join(runsRoot, "test-run", "experiments", low.experimentId, "stdout.txt"), "utf8");
-		const result = JSON.parse(await readFile(join(runsRoot, "test-run", "experiments", low.experimentId, "result.json"), "utf8"));
-		assert.equal(stdout, "output:local-probe\n");
-		assert.equal(result.execution.exitCode, 0);
-		assert.equal(result.conclusion.verdict, "SUPPORTS");
-		console.log("ctf-auditor state-machine test: ok");
+		console.log("ctf-auditor test: ok");
 	} finally {
 		await rm(workspace, { recursive: true, force: true });
 	}
